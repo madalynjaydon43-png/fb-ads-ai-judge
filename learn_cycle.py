@@ -3,6 +3,7 @@
 
     python learn_cycle.py status                       # 现在攒到哪一步了
     python learn_cycle.py check --csv X                # 这份导出能不能喂进来（列自检）
+    python learn_cycle.py views --paths A.csv B.csv     # 几份不同列的导出 → 去重 + 合并 + 缺口
     python learn_cycle.py backfill --mode sim          # 模拟数据回填（反事实真值表）
     python learn_cycle.py backfill --mode real --csv X # 真实导出回填（无反事实）
     python learn_cycle.py backtest                     # 判卷：模型 vs 规则回退
@@ -22,6 +23,7 @@ D = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, D)
 
 import flywheel
+import metric_views as mv
 import table_judger as tj_mod
 from table_judger import TableJudger, rule_action, truth_payoff
 
@@ -239,6 +241,166 @@ def cmd_check(args):
     return 1
 
 
+# ==================== views（多视图接入）====================
+
+def _fmt(v, digits=4):
+    if v is None:
+        return '—'
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f == 0:
+        return '0'
+    if abs(f) >= 100:
+        return '%.1f' % f
+    return ('%.' + str(digits) + 'f') % f
+
+
+def cmd_views(args):
+    """把同一账户的多份不同列导出 → 去重 → 合并 → 报告能多看到什么。"""
+    paths = list(args.paths or [])
+    if args.dir:
+        paths += mv.scan_dir(args.pattern or '*.csv', args.dir)
+    if not paths:
+        print('错误：至少给一个 --paths，或用 --dir 指一个目录。', file=sys.stderr)
+        return 2
+
+    print('=' * 88)
+    print('多视图接入 · 共 %d 份文件' % len(paths))
+    print('=' * 88)
+
+    ov = mv.overview(paths=paths)
+    exps = ov['exports']
+    if not exps:
+        print('没有可读的数据行。', file=sys.stderr)
+        return 2
+
+    # ---- 1. 每份是什么视图 ----
+    print()
+    print('【1】每份文件的视图识别')
+    print('  %-42s %-12s %4s %5s %5s %5s' % ('文件', '视图', '列', '行', '广告', '天数'))
+    print('  ' + '-' * 84)
+    for e in exps:
+        days = len(set(k[0] for k in e.keys()))
+        print('  %-42s %-12s %4d %5d %5d %5d'
+              % (e.name[:42], mv.view_cn(e.view), len(e.header), e.n, len(e.ads()), days))
+
+    # ---- 2. 去重 ----
+    print()
+    print('【2】过滤相同的 → 留下不同的（按表头指纹分组）')
+    for i, g in enumerate(ov['groups'], 1):
+        same = [m.name for m in g['members']]
+        print('  指纹%d（%s，%d 列）' % (i, mv.view_cn(g['view']), len(g['sig'])))
+        print('      留用：%s（%d 行）' % (g['kept'].name, g['kept'].n))
+        for d in g['dropped']:
+            reason = '行数更少' if d.n < g['kept'].n else '同表头且更旧'
+            print('      丢弃：%s（%d 行）—— 同一套指标，%s' % (d.name, d.n, reason))
+        if len(same) == 1:
+            print('      （这套指标只有一份）')
+    print()
+    print('  去重结果：%d 份 → %d 种不同的指标视图'
+          % (len(exps), len(ov['chosen'])))
+
+    # ---- 3. 合并 ----
+    wide = ov['wide']
+    mrep = ov['merge']
+    cols = mv.wide_header(wide)
+    print()
+    print('【3】按 (日期, 广告) 合并')
+    print('  宽表：%d 行 × %d 列（合并前最大的一份只有 %d 列）'
+          % (len(wide), len(cols), max(len(e.header) for e in exps)))
+    core_cols = 15
+    print('  其中 %d 列来自核心指标，另有 %d 列是**多视图才凑得出来的新信息**'
+          % (core_cols, max(0, len(cols) - core_cols)))
+    if mrep['conflicts']:
+        print('  ⚠️ 冲突 %d 处（同一(日期,广告)同一列，两份导出给了不同值）——'
+              % len(mrep['conflicts']))
+        print('     取文件更新的那份，但下面是全部明细，别当没看见：')
+        for c in mrep['conflicts'][:8]:
+            print('       %s | %s | %s: %s(%s) vs %s(%s)'
+                  % (c['key'][0], c['key'][1][:16], c['col'][:18],
+                     c['winner'][:14], c['winner_file'][:18],
+                     c['loser'][:14], c['loser_file'][:18]))
+        if len(mrep['conflicts']) > 8:
+            print('       …另有 %d 处' % (len(mrep['conflicts']) - 8))
+    else:
+        print('  ✅ 零冲突：重叠行逐格一致，证明各份是同一账户事实的不同列预设。')
+
+    # ---- 4. 缺口购物清单 ----
+    gap = ov['gap']
+    print()
+    print('【4】还缺哪些视图（这就是「该再导哪几份」）')
+    print('  已有：%s' % ('、'.join(mv.view_cn(v) for v in gap['present']) or '（无）'))
+    if gap['unknown']:
+        print('  没认出来：%s' % '、'.join(e.name for e in gap['unknown']))
+    if not gap['missing']:
+        print('  ✅ 五种视图齐了 —— 能看到的维度已经到头了。')
+    else:
+        for v, loss in gap['loss']:
+            print('  · 缺 %-11s → 失去：%s' % (mv.view_cn(v), loss))
+
+    # ---- 5. 预算列异常 ----
+    if ov['budget_anomaly']:
+        print()
+        print('【5】⚠️ 「广告组预算」列里有非数字（平台在某些广告组上填的是文案）')
+        for b in ov['budget_anomaly'][:6]:
+            print('  · %s → %r（%s）' % (b['ad'][:26], b['value'], b['file'][:22]))
+        print('  后果：读成 0 ⇒ 花费率、预算档这两个特征静默失效。'
+              '要用这两个特征，得先确认这些广告组的真实预算。')
+
+    # ---- 6. 扩展特征实算 ----
+    cov, n_ad = mv.ext_coverage(wide)
+    days_by_ad = ov['ext_days_by_ad']
+    print()
+    print('【6】扩展特征（核心 30 维之外，共 %d 维）· 实算覆盖率' % len(mv.EXT_FEATURE_KEYS))
+    if not n_ad:
+        print('  没有广告，跳过。')
+    else:
+        print('  %-20s %-10s %s' % ('特征', '算得出来', '说明'))
+        print('  ' + '-' * 82)
+        for k in mv.EXT_FEATURE_KEYS:
+            c = cov.get(k, 0)
+            mark = '✅' if c == n_ad else ('部分' if c else '✗ 缺列')
+            print('  %-20s %-10s %s'
+                  % (k, '%d/%d %s' % (c, n_ad, mark), mv.EXT_FEATURE_SPECS[k][0]))
+        print()
+        print('  逐条广告的实算值。括号里是**实际用了几天**——'
+              '分子分母必须同窗口，天数少 = 结论脆弱，别当结论用。')
+        keys = mv.EXT_FEATURE_KEYS
+        head = '  %-24s' % '广告'
+        for k in keys:
+            head += ' %11s' % k[:11]
+        print(head)
+        for ad, f in ov['ext_by_ad'].items():
+            line = '  %-24s' % ad[:24]
+            for k in keys:
+                v = f.get(k)
+                if v is None:
+                    cell = '—'
+                else:
+                    d = days_by_ad.get(ad, {}).get(k, 0)
+                    cell = '%s(%dd)' % (_fmt(v), d)
+                line += ' %11s' % cell[:11]
+            print(line)
+        suspects = []
+        for ad, r in ov['ext_report'].items():
+            for k in r.get('suspect', []):
+                suspects.append((ad, k, r['features'].get(k)))
+        if suspects:
+            print()
+            print('  ⚠️ 比值 > 1 的项（理论上不该 > 1）—— **不是算错，是平台两个指标分母不同**：')
+            for ad, k, v in suspects[:6]:
+                print('     %s · %s = %s' % (ad[:22], k, _fmt(v)))
+            print('     例：「视频播放进度达 25% 的次数」可以大于「播放视频达 3 秒的次数」，'
+                  '两个计数基底不同。')
+            print('     这类比值只能做同口径横向比较，别当绝对留存率读。')
+    print()
+    print('说明：扩展特征目前**不喂给模型**（核心 30 维一个字没动）。'
+          '要先有能验证它的数据，再谈要不要进模型。')
+    return 0
+
+
 # ==================== main ====================
 
 def build_parser():
@@ -269,6 +431,12 @@ def build_parser():
     c = sub.add_parser('check', help='列自检：这份导出能不能喂进来')
     c.add_argument('--csv', default=None, help='要检查的 CSV（默认检查仓库自带模拟数据）')
     c.set_defaults(func=cmd_check)
+
+    v = sub.add_parser('views', help='多视图接入：几份不同列的导出 → 去重 + 合并 + 报告')
+    v.add_argument('--paths', nargs='+', default=None, help='一份或多份导出 CSV')
+    v.add_argument('--dir', default=None, help='扫描目录（配合 --pattern）')
+    v.add_argument('--pattern', default='*.csv', help='目录里的文件名通配（默认 *.csv）')
+    v.set_defaults(func=cmd_views)
 
     t = sub.add_parser('backtest', help='判卷')
     t.add_argument('--store', default=P_STORE)

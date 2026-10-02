@@ -10,17 +10,20 @@
   · 特征口径用**独立实现**逐格比对，而不是自己跟自己比；
   · 需要 sklearn 的用例在没有 sklearn 时 skip，而不是假装通过。
 """
+import csv
 import io
 import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 D = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, D)
 
 import flywheel                                     # noqa: E402
+import metric_views as mv                           # noqa: E402
 import table_judger as tj                           # noqa: E402
 import fb_ai_engine as eng                          # noqa: E402
 
@@ -526,6 +529,250 @@ class TestStoreUntouchedByRepo(unittest.TestCase):
         """learning_store.jsonl 必须是运行时产物（落在仓库根、可被 .gitignore 排除）。"""
         self.assertEqual(os.path.basename(flywheel.P_STORE), 'learning_store.jsonl')
         self.assertEqual(os.path.dirname(flywheel.P_STORE), D)
+
+
+# ==================== 多视图接入（metric_views）====================
+
+# 五种视图的最小表头（只留签名列 + 日期 + 分组列），用于识别与合并用例。
+H_CONV = ['报告开始日期', '广告系列名称', '展示次数', '链接点击量', '已花费金额 (USD)',
+          '加入购物车次数', '购物次数', '购物转化价值']
+H_CLICK = ['报告开始日期', '广告系列名称', '展示次数', '链接点击量', '点击量（全部）',
+           '点击率（全部）', '落地页浏览量', '已花费金额 (USD)']
+H_VIDEO = ['报告开始日期', '广告系列名称', '展示次数', '播放视频达 3 秒的次数',
+           'ThruPlay 次数', '视频播放进度达 25% 的次数', '视频播放进度达 50% 的次数',
+           '视频播放进度达 100% 的次数']
+H_ENG = ['报告开始日期', '广告系列名称', '展示次数', '公共主页互动量', '帖子评论数',
+         '帖子分享次数', 'Facebook 获赞数', 'Instagram 关注次数']
+H_COST = ['报告开始日期', '广告系列名称', '单次成效费用', '结束日期']
+
+
+def _write_export(header, rows, mtime=None):
+    """写一份临时导出（BOM + 表头 + 数据行）。mtime 可指定，用于「更新的优先」用例。"""
+    fd, p = tempfile.mkstemp(suffix='.csv')
+    os.close(fd)
+    with io.open(p, 'w', encoding='utf-8-sig', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+    if mtime is not None:
+        os.utime(p, (mtime, mtime))
+    return p
+
+
+class TestViewDetection(unittest.TestCase):
+    """视图识别 —— 决定「这份导出是哪一套指标」。"""
+
+    def test_five_views_detected(self):
+        for header, expect in ((H_CONV, 'conversion'), (H_CLICK, 'click'),
+                               (H_VIDEO, 'video'), (H_ENG, 'engagement'),
+                               (H_COST, 'cost')):
+            with self.subTest(view=expect):
+                name, hit = mv.detect_view(header)
+                self.assertEqual(name, expect)
+                self.assertGreater(hit, 0)
+
+    def test_unknown_header(self):
+        """一套签名列都不沾 → unknown，不许瞎猜。"""
+        name, hit = mv.detect_view(['报告开始日期', '广告系列名称', '备注'])
+        self.assertEqual(name, 'unknown')
+        self.assertEqual(hit, 0)
+
+    def test_signature_ignores_column_order_and_spaces(self):
+        """表头指纹与列顺序/空格无关：同一套指标换个次序还是同一份。"""
+        a = ['报告开始日期', '广告系列名称', '展示次数']
+        b = ['展示次数', ' 广告系列名称', '报告开始日期']
+        self.assertEqual(mv.header_sig(a), mv.header_sig(b))
+
+
+class TestDedupe(unittest.TestCase):
+    """过滤相同的 → 留下不同的。"""
+
+    def test_same_header_keep_more_rows(self):
+        small = _write_export(H_CONV, [['2026-01-01', '广告A'] + ['0'] * 6])
+        big = _write_export(H_CONV, [['2026-01-0%d' % i, '广告A'] + ['0'] * 6 for i in (1, 2, 3)])
+        exps = [mv.load_export(big), mv.load_export(small)]
+        groups, chosen, dropped = mv.dedupe_exports(exps)
+        self.assertEqual(len(groups), 1, '同表头必须归到一组')
+        self.assertEqual(len(chosen), 1)
+        self.assertEqual(chosen[0].n, 3, '应当留数据行更多的那份')
+        self.assertEqual([d.n for d in dropped], [1])
+
+    def test_different_headers_all_kept(self):
+        paths = [_write_export(H_CONV, [['2026-01-01', 'A'] + ['0'] * 6]),
+                 _write_export(H_VIDEO, [['2026-01-01', 'A'] + ['0'] * 7])]
+        _, chosen, dropped = mv.dedupe_exports([mv.load_export(p) for p in paths])
+        self.assertEqual(len(chosen), 2)
+        self.assertEqual(dropped, [])
+
+
+class TestMerge(unittest.TestCase):
+    """按 (日期, 广告) 拼宽表；冲突必须报出来。"""
+
+    def test_two_views_merge_into_one_row(self):
+        p1 = _write_export(H_CONV, [['2026-01-01', '广告A', '1000', '100', '20',
+                                     '5', '2', '80']])
+        p2 = _write_export(H_CLICK, [['2026-01-01', '广告A', '1000', '100', '1500',
+                                      '6.0', '90', '20']])
+        wide, _ = mv.merge_exports([mv.load_export(p1), mv.load_export(p2)])
+        self.assertEqual(len(wide), 1, '同一天同一广告只能有一行')
+        row = list(wide.values())[0]
+        self.assertIn('购物转化价值', row, '转化视图的列要在')
+        self.assertIn('点击量（全部）', row, '点击视图的列也要在')
+
+    def test_conflict_is_reported_and_newest_wins(self):
+        now = time.time()
+        old = _write_export(H_CONV, [['2026-01-01', '广告A', '1000', '100', '7.56',
+                                      '5', '2', '80']], mtime=now - 10000)
+        new = _write_export(H_CONV, [['2026-01-01', '广告A', '1000', '100', '21.53',
+                                      '5', '2', '80']], mtime=now)
+        wide, rep = mv.merge_exports([mv.load_export(old), mv.load_export(new)])
+        self.assertEqual(len(rep['conflicts']), 1, '同一格的两种取值必须留下记录')
+        self.assertEqual(rep['conflicts'][0]['winner'], '21.53')
+        row = list(wide.values())[0]
+        self.assertEqual(row['已花费金额 (USD)'], '21.53', '更新的那份胜出')
+
+    def test_identical_values_are_not_conflicts(self):
+        now = time.time()
+        a = _write_export(H_CONV, [['2026-01-01', '广告A', '1000', '100', '9.9',
+                                    '5', '2', '80']], mtime=now - 100)
+        b = _write_export(H_CONV, [['2026-01-01', '广告A', '1000', '100', '9.9',
+                                    '5', '2', '80']], mtime=now)
+        _, rep = mv.merge_exports([mv.load_export(a), mv.load_export(b)])
+        self.assertEqual(rep['conflicts'], [], '值一样就不是冲突')
+
+
+class TestExtFeatures(unittest.TestCase):
+    """扩展特征：窗口必须配对、不可算必须是 None、比值 > 1 必须报警。"""
+
+    def _one_ad(self, header, rows):
+        p = _write_export(header, rows)
+        wide, _ = mv.merge_exports([mv.load_export(p)])
+        return mv.ext_report_by_ad(wide)['广告A']
+
+    def test_paired_window_not_mixed(self):
+        """分子只在第 2 天有值 → 分母也必须只取第 2 天，不能拿两天的点击去除。
+
+        实测教训：互动系列的「落地页浏览量」只报 1 天，「链接点击量」报 4 天，
+        不配对窗口会算出 0.0028（真实是 0.0317，差 11 倍）。
+        """
+        rep = self._one_ad(H_CLICK, [
+            ['2026-01-01', '广告A', '1000', '100', '1200', '6.0', '', '10'],
+            ['2026-01-02', '广告A', '2000', '200', '1400', '7.0', '50', '10'],
+        ])
+        self.assertAlmostEqual(rep['features']['落地页到达率'], 50.0 / 200.0, places=6)
+        self.assertEqual(rep['days']['落地页到达率'], 1, '只用了 1 天，必须能看出来')
+
+    def test_unavailable_is_none_not_zero(self):
+        """缺列 → None（不是 0.0）。「这项没读到」和「这项是 0」不能混。"""
+        rep = self._one_ad(H_CONV, [['2026-01-01', '广告A', '1000', '100', '20',
+                                     '5', '2', '80']])
+        self.assertIsNone(rep['features']['3秒播放率'])
+        self.assertIsNone(rep['features']['全部点击倍数'])
+        self.assertEqual(rep['days']['3秒播放率'], 0)
+
+    def test_ratio_over_one_is_flagged(self):
+        """v25 > video_3s（平台两个指标基底不同）→ 必须进 suspect 报警。"""
+        rep = self._one_ad(H_VIDEO, [['2026-01-01', '广告A', '1000', '100',
+                                      '10', '120', '60', '30']])
+        self.assertGreater(rep['features']['视频留存25'], 1.0)
+        self.assertIn('视频留存25', rep['suspect'])
+        self.assertNotIn('视频留存50', rep['suspect'])
+
+    def test_union_header_not_first_row(self):
+        """视频列只存在于最后一天时，也要能算出来（不能只看第一行表头）。
+
+        实测教训：视频/互动视图只覆盖最后 4 天，用 rows[0].keys() 会整块漏掉。
+        """
+        p1 = _write_export(H_CONV, [['2026-01-01', '广告A', '1000', '100', '20',
+                                     '5', '2', '80'],
+                                    ['2026-01-02', '广告A', '2000', '200', '30',
+                                     '6', '3', '90']])
+        # H_VIDEO 列序：日期, 名称, 展示次数, 3秒播放, ThruPlay, 25%, 50%, 100%
+        p2 = _write_export(H_VIDEO, [['2026-01-02', '广告A', '2000', '200',
+                                      '80', '150', '100', '40']])
+        wide, _ = mv.merge_exports([mv.load_export(p1), mv.load_export(p2)])
+        rep = mv.ext_report_by_ad(wide)['广告A']
+        self.assertIsNotNone(rep['features']['3秒播放率'], '视频列在第二天，仍须算得出')
+        self.assertAlmostEqual(rep['features']['3秒播放率'], 200.0 / 2000.0, places=6)
+        self.assertAlmostEqual(rep['features']['视频完播率'], 40.0 / 200.0, places=6)
+        self.assertEqual(rep['days']['3秒播放率'], 1)
+
+    def test_ext_keys_disjoint_from_core(self):
+        """扩展维度不许和核心 30 维重名 —— 免得以后混起来分不清谁是谁。"""
+        self.assertEqual(len(tj.FEATURE_KEYS), 30)
+        self.assertEqual(len(mv.EXT_FEATURE_KEYS), 13)
+        self.assertEqual(set(tj.FEATURE_KEYS) & set(mv.EXT_FEATURE_KEYS), set())
+
+    def test_core_feature_keeps_30(self):
+        """接入多视图**不许**动核心 30 维（动了历史成绩全部作废）。"""
+        self.assertEqual(len(tj.FEATURE_KEYS), 30)
+        self.assertEqual(tj.FEATURE_KEYS[0], '花费')
+        self.assertEqual(tj.FEATURE_KEYS[-1], '首单在第几天')
+        # 合并真实/模拟数据都不该改变核心维度清单
+        rows = tj.read_csv_rows(P_SIM)
+        self.assertEqual(len(tj.FEATURE_KEYS), 30)
+        self.assertGreater(len(rows), 0)
+
+
+class TestBudgetAnomaly(unittest.TestCase):
+    def test_text_budget_is_detected(self):
+        """平台把文案写进「广告组预算」列时要报出来，否则读成 0 而无声。"""
+        p = _write_export(['报告开始日期', '广告系列名称', '广告组预算', '广告组预算类型'],
+                          [['2026-01-01', '广告A', '使用广告组预算', '0']])
+        bad = mv.budget_anomaly([mv.load_export(p)])
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]['value'], '使用广告组预算')
+
+    def test_numeric_budget_is_clean(self):
+        p = _write_export(['报告开始日期', '广告系列名称', '广告组预算', '广告组预算类型'],
+                          [['2026-01-01', '广告A', '40', '单日预算']])
+        self.assertEqual(mv.budget_anomaly([mv.load_export(p)]), [])
+
+
+class TestRealExports(unittest.TestCase):
+    """真实账户的 6 份导出（若本机存在）—— 端到端跑一遍。"""
+
+    # 真实导出的目录：默认「下载」文件夹，可用环境变量覆盖。
+    # ⚠️ 不要写死带用户名的绝对路径 —— 这个文件是公开仓库的一部分。
+    DL = os.environ.get('FB_EXPORT_DIR', os.path.expanduser(os.path.join('~', 'Downloads')))
+
+    def _paths(self):
+        import glob
+        return sorted(glob.glob(os.path.join(self.DL, 'voglyn*.csv')))
+
+    def test_six_files_dedupe_to_five_views(self):
+        paths = self._paths()
+        if len(paths) < 6:
+            self.skipTest('本机没有那 6 份真实导出')
+        ov = mv.overview(paths=paths)
+        self.assertEqual(len(ov['exports']), 6)
+        self.assertEqual(len(ov['chosen']), 5, '6 份里有两份是同一套指标')
+        self.assertEqual(len(ov['dropped']), 1)
+        self.assertEqual(ov['merge']['conflicts'], [], '同源导出不该有冲突')
+        self.assertFalse(ov['gap']['missing'], '五种视图应当齐了：%s' % ov['gap']['missing'])
+
+    def test_wide_table_has_more_columns_than_any_single_export(self):
+        paths = self._paths()
+        if len(paths) < 6:
+            self.skipTest('本机没有那 6 份真实导出')
+        ov = mv.overview(paths=paths)
+        widest = max(len(e.header) for e in ov['exports'])
+        self.assertGreater(len(mv.wide_header(ov['wide'])), widest,
+                           '合并后必须比任何单份都宽')
+        self.assertEqual(len(ov['wide']), 177)
+
+    def test_ext_coverage_reflects_missing_days(self):
+        paths = self._paths()
+        if len(paths) < 6:
+            self.skipTest('本机没有那 6 份真实导出')
+        ov = mv.overview(paths=paths)
+        rep = ov['ext_report']
+        # 视频/互动视图只覆盖 4 天 → 长袖/短袖那些广告的支撑天数必然少
+        some_days = [d for r in rep.values() for d in r['days'].values() if d]
+        self.assertTrue(some_days)
+        self.assertTrue(any(d <= 4 for d in some_days),
+                        '必须能看出有些比值只基于很少的天数')
 
 
 if __name__ == '__main__':

@@ -33,6 +33,9 @@ __pycache__/
 /_solvability_v5_out.txt
 /gen_v5_out.txt
 /_case_out_*.txt
+/_lint_attrs_out.txt
+/_lint_dupdef_out.txt
+/_lint_unbound_out.txt
 
 # 模型权重
 _laya_model/

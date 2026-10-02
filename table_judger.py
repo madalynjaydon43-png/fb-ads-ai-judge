@@ -786,11 +786,7 @@ class TableJudger:
         else:
             by_name = {s['ad_name']: s for s in usable if s.get('ad_name')}
             names = [n for n in by_name if n in idx]
-
-            def pick_no_truth(name):
-                return pick_by_name(name)
-
-            res = _score_by_outcome(names, pick_no_truth, by_name)
+            res = _score_by_outcome(names, pick_by_name, by_name)
         res['folds'] = folds
         res['abstain'] = sum(1 for f in use_rule if f)
         counts = {}

@@ -10,7 +10,9 @@
   任何 `self.X` 的**读取**若不在已定义集合里 → 报可疑（大概率是拼写错误）。
 
 已知会误报、需白名单的情况：
-  · 属性由父类 / mixin 定义（本工具没有继承，忽略）
+  · 属性由父类 / mixin 定义 —— **已处理**：类若有本文件之外的父类，直接跳过
+    （否则 `unittest.TestCase` 里的 self.assertEqual 会刷出几十条假警报，
+     真问题被淹掉）
   · 通过 setattr 动态挂的
   · Tk 的事件回调名（tag_bind 传字符串，不是 self.X）
 用法：
@@ -65,6 +67,26 @@ def used_names(cls):
     return used
 
 
+def foreign_bases(cls, local_classes):
+    """返回该类的「本文件之外的父类」名列表。
+
+    有这种父类时，类的属性可能由父类/mixin 提供，静态看不到 —— 必须跳过，
+    否则 unittest.TestCase 子类里的 self.assertEqual 会被当成拼写错误。
+    """
+    out = []
+    for b in cls.bases:
+        if isinstance(b, ast.Name):
+            if b.id == 'object' or b.id in local_classes:
+                continue
+            out.append(b.id)
+        elif isinstance(b, ast.Attribute):
+            # unittest.TestCase 这种「模块.类」写法
+            out.append('%s.%s' % (getattr(b.value, 'id', '?'), b.attr))
+        else:
+            out.append('<表达式>')
+    return out
+
+
 def check(path):
     try:
         src = open(path, 'rb').read().decode('utf-8')
@@ -73,8 +95,14 @@ def check(path):
         say('  !! %s: %s' % (path, e))
         return 1
     n = 0
+    local_classes = set(x.name for x in ast.walk(tree) if isinstance(x, ast.ClassDef))
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
+            continue
+        fb = foreign_bases(node, local_classes)
+        if fb:
+            say('  SKIP %s :: class %s（父类 %s，继承来的属性静态判不了）'
+                % (path, node.name, '、'.join(fb)))
             continue
         d = defined_names(node)
         u = used_names(node)
