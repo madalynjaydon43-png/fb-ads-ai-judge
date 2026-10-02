@@ -1,0 +1,13 @@
+{
+  "_说明": "复制成 ai_config.json 再填自己的值。任何 OpenAI 兼容端点都行（本地网关 / vLLM / 官方 API）。",
+  "base_url": "http://127.0.0.1:20128/v1",
+  "api_key": "PUT-YOUR-OWN-KEY-HERE",
+  "model": "your-model-name",
+  "interval_minutes": 3,
+  "max_budget_change_pct": 20,
+  "suggestion_limit": 0,
+  "batch_size": 10,
+  "concurrent_workers": 3,
+  "stagger_seconds": 4,
+  "lookback_days": 7
+}

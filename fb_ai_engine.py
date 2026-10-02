@@ -1,0 +1,770 @@
+# -*- coding: utf-8 -*-
+"""
+AI 广告决策引擎（纯逻辑层，无 GUI 依赖）
+链路：数据快照 -> prompt -> 9router LLM -> 结构化决策
+
+判断权完全交给 LLM（2026-09-30 用户决定撤掉规则层）：
+  - 第 1 层「规则预筛」（原 _prescreen.py 的 rule_score 硬阈值打标）已撤
+  - 第 3 层「输出护栏」（原 apply_guardrails 的预算幅度夹取）已改开关，默认关闭
+只保留工程必需项：同对象同轮去重、建议条数截断。
+
+2026-10-02 补回两条「钱相关的硬线」（不是恢复老的阈值打标，是被实测打回来的一部分）：
+  - 关停护栏 enforce_risk_guardrails：止损线（净≤0 强制停）+ 禁杀线（净>0 禁止停）
+  - 加预算提名：规则提名、人拍板（**不默认替 AI 做决定**）
+  原因见该函数上方注释：AI 关停漏杀 9 条、误杀 6 条（误杀代价是漏杀的 11 倍），
+  而把这些道理写进提示词会让总账更差 —— 硬线只能放代码里。
+"""
+import json
+import os
+import time
+import re
+from datetime import datetime, timedelta
+
+# ---------- 规则层开关（默认全撤，AI 全权判断）----------
+ENABLE_BUDGET_CAP = False   # 第3层护栏：是否把预算调幅夹取到 max_budget_change_pct。False=不夹，AI 说多少就是多少
+
+# ---------- 关停护栏 & 加预算提名（2026-10-02 新增）----------
+# 起因：在 v5 模拟数据（100 广告）上实测，AI 的关停判断有两处系统性偏差：
+#   · 漏杀 9 条 —— 真值「暂停」却给 observe。它们唯一共性是「亏得不够多」（亏 -35 vs 判停组的 -79），
+#     说明 AI 有一条未言明的「亏得够多才停」的线，从没写进规则。
+#   · 误杀 6 条 —— 其中 3 条可见窗口在赚钱。代价 $715，是漏杀代价（$66）的 11 倍。
+# 实测四方对照（100 条 · 后 5 天净收益口径）：
+#   ① 纯 AI 57 分（漏杀 -$66 / 误杀 -$715）
+#   ② AI + 提示词护栏 63 分（漏杀 $0 / 误杀 -$824，**更糟**）→ 给 AI 讲道理 = 放大它原有的毛病
+#   ③ AI + 代码护栏 68 分（漏杀 $0 / 误杀 +$2）           ← 本模块实现的就是这个
+#   ④ 纯规则 80 分
+# 结论：AI 是好审查员，不是好决策者。钱相关的硬线放代码里，不放提示词里。
+#
+# ⚠️ 口径与适用边界（换数据必须重算，别当成普适真理）：
+#   · 「净」= 窗口内 Σ购买价值 − Σ花费（**不含货成本**），只用来判断这笔广告投得值不值。
+#   · 止损线 / 禁杀线 / 提名阈值全部是在**本机 v5 模拟数据**上拟合的。那份数据的规律由机制生成，
+#     规则天然占优；真实账户形态更杂，这 12 分优势不能直接搬过去。阈值先用着，真实数据到手再校。
+ENABLE_KILL_GUARDRAIL = True     # 关停护栏（止损线 + 禁杀线）
+ENABLE_BUDGET_NOMINATION = True  # 加预算规则提名（**只提名，不改 AI 的动作**）
+
+KILL_STOP_NET = 0.0       # 止损线：可见窗口净额 ≤ 此值 → 强制暂停（这段没赚钱，放量救不了亏损）
+NOMINATE_FILL_RATE = 0.90  # 提名线①：顶格率 ≥ 此值 —— 预算卡住了它，不是它跑不动
+NOMINATE_FREQ_MAX = 1.35   # 提名线②：末段频次 < 此值 —— 受众还没看腻，还有没触达的人
+NOMINATE_MIN_DAYS = 3      # 样本下限：窗口不足这么多天不提名（少样本的高 ROAS 是噪声）
+
+# ---------- 配置 ----------
+AI_CONFIG_DEFAULTS = {
+    "base_url": "",          # 例如 https://xxx.9router.com/v1（OpenAI 兼容）
+    "api_key": "",           # 9router key（建议放环境变量 AI_API_KEY，不放代码里）
+    "model": "deepseek-v4-flash",
+    "interval_minutes": 3,   # 判断频率（用户拍板：3分钟）
+    "max_budget_change_pct": 20,     # 仅供参考值：写进 prompt 让 AI 知道合理量级，不做强制夹取
+    "suggestion_limit": 5,           # 单轮最多返回建议数
+    "batch_size": 10,                # 每批投喂条数（快照含逐日明细后单条约 2.3K 字符）
+    "concurrent_workers": 3,         # 并发投喂路数；1 = 退回串行
+    "stagger_seconds": 4,            # 每轮之间的错峰间隔（实测 4s 时 429 归零）
+}
+
+
+# ---------- 快照 ----------
+def _compute_age_hours(c):
+    """从 start_time 计算系列上线时长（小时），无 start_time 返回 None"""
+    st = c.get('start_time')
+    if not st:
+        return None
+    try:
+        # 兼容 '2026-09-17T00:00:00+0800'（+0800 是旧式时区格式，先补冒号转标准 ISO）
+        s = st.strip()
+        if 'T' in s:
+            if s.endswith('+0800'):
+                s = s[:-5] + '+08:00'
+            dt = datetime.fromisoformat(s)
+            now = datetime.now(dt.tzinfo)  # 与解析结果对齐时区，避免 naive/aware 相减
+        else:
+            dt = datetime.strptime(s[:19], '%Y-%m-%d %H:%M:%S')
+            now = datetime.now()
+        age = (now - dt).total_seconds() / 3600
+        return round(age, 1) if age >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _sample_stats(days):
+    """
+    由代码算好「样本量」，塞进快照 —— 不让模型自己数。
+
+    2026-10-01 修正起因：prompt 里要求「给 increase_budget 必须写出样本量」，
+    模型照写了，但**数错了** —— 把「7天里出6单」写成「6天有单共6单」，
+    9 轮里反复这么写。它自报的样本量本身就是错的，整个推理起点就歪了。
+    能算的东西就该由代码算：模型负责判断，不负责算术。
+
+    返回 dict（无逐日明细时返回 None）：
+      days                    窗口天数（有数据的天数）
+      days_with_orders        出单天数
+      orders_total            窗口内总单数
+      days_spend_no_order     花了钱但零单的天数
+      last3_days              最近3天实际天数（窗口不足3天时等于窗口天数）
+      last3_spend/last3_orders/last3_roas   最近3天合计
+      longest_zero_order_streak  最长「连续有花费且零单」天数
+      first_order_date        首次出单日期
+    """
+    n = len(days)
+    if n == 0:
+        return None
+    orders = days_with_orders = days_spend_no_order = 0
+    longest = cur = 0
+    first_order_date = ''
+    for d in days:
+        pur = int(d.get('purchase') or 0)
+        sp = float(d.get('spend') or 0)
+        orders += pur
+        if pur > 0:
+            days_with_orders += 1
+            cur = 0
+            if not first_order_date:
+                first_order_date = d.get('date', '')
+        else:
+            if sp > 0:
+                days_spend_no_order += 1
+                cur += 1
+                if cur > longest:
+                    longest = cur
+            else:
+                cur = 0        # 当天没投，不算进「连续烧钱零单」
+    last3 = days[-3:]
+    l3s = round(sum(float(d.get('spend') or 0) for d in last3), 2)
+    l3o = sum(int(d.get('purchase') or 0) for d in last3)
+    l3v = sum(float(d.get('purchase_value') or 0) for d in last3)
+    out = {
+        "days": n,
+        "days_with_orders": days_with_orders,
+        "orders_total": orders,
+        "days_spend_no_order": days_spend_no_order,
+        "last3_days": len(last3),
+        "last3_spend": l3s,
+        "last3_orders": l3o,
+        "last3_roas": round(l3v / l3s, 2) if l3s > 0 else 0.0,
+        "longest_zero_order_streak": longest,
+    }
+    if first_order_date:
+        out["first_order_date"] = first_order_date
+    return out
+
+
+def _net_view(days, daily_budget=None):
+    """
+    可见窗口的「钱账」—— 由代码算好，塞进快照，也是关停护栏的输入。
+
+    为什么单独立一个：判断「关停」这件事，看的是**钱**（净额），不是**单**（购买次数）。
+    2026-10-02 实测（v5 数据）：「连着两天零单就不加」命中率 62%，而「看这几天是赚还是亏」79%。
+    更直接的一条：某广告 5 天 274 次点击只出 3 单（转化率 1.095%），
+    **按这个转化率连着两天零单的自然概率是 29.9%** —— 零单不是信号，是运气。
+
+    返回 dict（无逐日明细时返回 None）：
+      days/spend/revenue/net/roas      窗口合计与净额（net = revenue − spend）
+      active_days                      有花费的天数
+      fill_rate                        顶格率 = 花费达到日预算 95% 的天数 / 有花费的天数
+      freq_first/freq_last             首/末个有花费天的频次（看受众消耗速度）
+      cum_net_min                      累计净额的最低点（最深亏到多少）
+      cum_negative_since               累计净额首次转负的日期（「该在哪天止损」的锚点）
+    """
+    n = len(days)
+    if n == 0:
+        return None
+    spend_total = revenue_total = 0.0
+    active = full_days = 0
+    cum = worst = 0.0
+    neg_since = None
+    freq_first = freq_last = None
+    for d in days:
+        sp = float(d.get('spend') or 0)
+        pv = float(d.get('purchase_value') or 0)
+        spend_total += sp
+        revenue_total += pv
+        cum += pv - sp
+        if cum < 0 and neg_since is None:
+            neg_since = d.get('date', '')
+        if cum < worst:
+            worst = cum
+        if sp > 0:
+            active += 1
+            bud = float(daily_budget or 0)
+            if bud > 0 and sp >= 0.95 * bud:
+                full_days += 1
+            f = d.get('frequency')
+            if f not in (None, ''):
+                try:
+                    f = float(f)
+                except (TypeError, ValueError):
+                    f = None
+                if f is not None:
+                    if freq_first is None:
+                        freq_first = f
+                    freq_last = f
+    out = {
+        "days": n,
+        "spend": round(spend_total, 2),
+        "revenue": round(revenue_total, 2),
+        "net": round(cum, 2),
+        "roas": round(revenue_total / spend_total, 2) if spend_total > 0 else 0.0,
+        "active_days": active,
+        "cum_net_min": round(worst, 2),
+    }
+    if active > 0:
+        out["fill_rate"] = round(full_days / active, 3)
+    if freq_first is not None:
+        out["freq_first"] = round(freq_first, 3)
+        out["freq_last"] = round(freq_last, 3)
+    if neg_since:
+        out["cum_negative_since"] = neg_since
+    return out
+
+
+def make_snapshot(campaigns_insights):
+    """
+    把系列洞察列表整理成给 LLM 的结构化摘要。
+    campaigns_insights: [{'id','name','status','spend','impressions','clicks',
+                          'cpc','cpm','purchase','purchase_value','cost_per_purchase', 'start_time'?}, ...]
+    """
+    rows = []
+    for c in campaigns_insights:
+        spend = float(c.get('spend') or 0)
+        purchase_value = float(c.get('purchase_value') or 0)
+        roas = (purchase_value / spend) if spend > 0 else 0.0
+        impressions = int(c.get('impressions') or 0)
+        clicks = int(c.get('clicks') or 0)
+        add_to_cart = int(c.get('add_to_cart') or 0)
+        initiate_checkout = int(c.get('initiate_checkout') or 0)
+        add_payment_info = int(c.get('add_payment_info') or 0)
+        view_content = int(c.get('view_content') or 0)
+        row = {
+            "id": c.get('id'),
+            "name": c.get('name', ''),
+            "status": c.get('status', ''),
+            "objective": c.get('objective', ''),   # 广告目标（OUTCOME_SALES/OUTCOME_ENGAGEMENT等）
+            "budget_type": c.get('budget_type', ''),   # ABO（广告组级预算）/ CBO（系列级预算）
+            "campaign_daily_budget": c.get('campaign_daily_budget'),  # 系列日预算（CBO 时有效）
+            "adset_daily_budget": c.get('adset_daily_budget'),        # 广告组日预算（ABO 时有效）
+            "ad_type": c.get('ad_type', ''),       # 广告类型：基础 / ASC / DPA
+            "spend": round(spend, 2),
+            "impressions": impressions,
+            "reach": int(c.get('reach') or 0),     # 覆盖人数
+            "frequency": round(float(c.get('frequency') or 0), 2),    # 频次（展示/覆盖）
+            "clicks": clicks,
+            "ctr": round((clicks / impressions * 100) if impressions > 0 else 0, 2),   # 点击率 %
+            "cpc": round(float(c.get('cpc') or 0), 2),
+            "cpm": round(float(c.get('cpm') or 0), 2),
+            # 转化漏斗（销量广告重点）
+            "add_to_cart": add_to_cart,
+            "initiate_checkout": initiate_checkout,
+            "add_payment_info": add_payment_info,
+            "view_content": view_content,
+            "purchase": int(c.get('purchase') or 0),
+            "purchase_value": round(purchase_value, 2),
+            "cost_per_purchase": round(float(c.get('cost_per_purchase') or 0), 2),
+            "roas": round(roas, 2),
+            # 漏斗转化率（购买/加购）
+            "cart_to_purchase_rate": round((int(c.get('purchase') or 0) / add_to_cart * 100) if add_to_cart > 0 else 0, 2),
+        }
+        if c.get('age_hours') is not None:
+            row['age_hours'] = c.get('age_hours')
+        else:
+            age = _compute_age_hours(c)
+            if age is not None:
+                row['age_hours'] = age
+        # 每日数据（广告级「完整生命周期」判断用）：**完整透传**，不再精简
+        # 2026-09-30 修正：旧版只保留 date/spend/purchase 三项，AI 每天只看到「花了多少、出几单」
+        #   两条线，看不到逐日点击/加购/结账/支付/覆盖/频次的波动 —— 无法判断「转化死在哪一环」、
+        #   「当天是素材崩了还是时段没到」。现在按天给全字段。
+        # 控体积规则：有花费的天输出全部转化字段（0 也要给，因为「有花费但0加购」本身就是信号）；
+        #   零花费的天只留 date+spend（当天没投，其余全无意义）。
+        if c.get('daily_spend') is not None:
+            days = []
+            for d in c['daily_spend']:
+                spend = round(float(d.get('spend') or 0), 2)
+                it = {'date': d.get('date', ''), 'spend': spend}
+                if spend > 0:
+                    imp = int(d.get('impressions') or 0)
+                    clk = int(d.get('clicks') or d.get('inline_link_clicks') or 0)
+                    if imp:
+                        it['impressions'] = imp
+                        it['ctr'] = round(clk / imp * 100, 2) if clk else 0.0
+                        it['cpm'] = round(spend * 1000 / imp, 2)
+                    if clk:
+                        it['clicks'] = clk
+                    for src, dst in (('reach', 'reach'), ('frequency', 'frequency'),
+                                     ('add_to_cart', 'add_to_cart'),
+                                     ('initiate_checkout', 'initiate_checkout'),
+                                     ('add_payment_info', 'add_payment_info'),
+                                     ('view_content', 'view_content')):
+                        v = d.get(src)
+                        if v not in (None, ''):
+                            it[dst] = round(float(v), 2) if dst == 'frequency' else int(float(v))
+                    pur = int(d.get('purchase') or 0)
+                    pv = float(d.get('purchase_value') or 0)
+                    it['purchase'] = pur
+                    it['purchase_value'] = round(pv, 2)
+                    it['roas'] = round(pv / spend, 2) if spend > 0 else 0.0
+                days.append(it)
+            row['daily_spend'] = days
+            # 样本量由代码算好（模型会数错，见 _sample_stats 注释）
+            _smp = _sample_stats(days)
+            if _smp:
+                row['sample'] = _smp
+            # 钱账也由代码算好（护栏的输入；顺带让模型不必自己从逐日明细里加总）
+            _nv = _net_view(days, row.get('adset_daily_budget') or row.get('campaign_daily_budget'))
+            if _nv:
+                row['net_view'] = _nv
+        rows.append(row)
+    return rows
+
+
+def build_prompt(snapshot, config, window=None):
+    """
+    构造发给 LLM 的 prompt。config 是完整配置（含业务规则阈值）。
+    要求模型只输出 JSON，便于程序解析。
+    业务边界：不限制"在跑"，多日/单日数据都判断；有历史看多日变化，只有单日看单日表现。
+    判断本身交给模型（人肉式投放经验）。
+
+    window: 可选 (start_date, end_date) 字符串元组，覆盖 prompt 里的口径声明。
+            不传 = 按 config['lookback_days'] 从今天往前推（生产行为）。
+            传 = 用给定区间（拿上传的历史文件测 AI 时用 —— 模拟数据是 09-23~09-29，
+                 若还按「今天往前推 7 天」声明，prompt 说的窗口就和数据里的日期对不上，
+                 模型会拿一个错误的"今天"去判断趋势）。
+    """
+    # 口径声明要用到（2026-09-30）：模型必须知道这些汇总是「最近 N 天」而不是全历史累计。
+    # 不写清楚时模型会把顶层 spend 当成累计/今天的数，理由里就会出现与界面显示对不上的花费。
+    try:
+        lookback_days = int(config.get('lookback_days', 7) or 7)
+    except (TypeError, ValueError):
+        lookback_days = 7
+    if window and len(window) >= 2 and window[0] and window[1]:
+        window_start = str(window[0])
+        today_str = str(window[1])
+        try:
+            d0 = datetime.strptime(window_start, '%Y-%m-%d')
+            d1 = datetime.strptime(today_str, '%Y-%m-%d')
+            lookback_days = max(1, (d1 - d0).days + 1)
+        except ValueError:
+            pass   # 日期格式不是 YYYY-MM-DD 就只覆盖声明文字，天数保持原值
+    else:
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        window_start = (datetime.now() - timedelta(days=lookback_days - 1)).strftime('%Y-%m-%d')
+
+    keys = ('max_budget_change_pct', 'business_rules')
+    rules = {k: config.get(k) for k in keys if k in config}
+    rules_text = json.dumps(rules, ensure_ascii=False, indent=2)
+    snap_text = json.dumps(snapshot, ensure_ascii=False, indent=2)
+    n = len(snapshot)
+    # 数据缺口声明（2026-09-30）：用上传文件测 AI 时，导出表可能**结构性缺列**（实测 700 行
+    # 那份没有「内容查看」列 → view_content 全是 0）。若不说，模型会把「缺列」读成
+    # 「真实的零内容查看」，进而把「0 内容查看却有加购」当成数据异常 → 判断整体偏保守（实测召回率掉一半）。
+    # 缺列是**数据事实**，必须显式告诉模型，而不是让它自己猜。
+    note = str(config.get('data_note') or '').strip()
+    note_text = (f"\n【本批数据的已知缺口 —— 判断时必须考虑，别把「缺列」当成真实的 0】\n{note}\n"
+                 if note else "")
+    return (
+        "直接输出 JSON 数组，不要任何前缀文字、解释或思考过程。\n"
+        f"你是资深 Facebook 广告投放优化师。**今天是 {today_str}**。下面是 {n} 条广告的数据快照：每条含汇总指标"
+        "（spend / roas / 漏斗各环节 / ctr / cpm / frequency / 预算类型等）、**程序算好的样本量 sample**、"
+        "与**逐日明细 daily_spend**。\n"
+        "【数据口径 —— 必须先读懂再判断】\n"
+        f"  · 时间窗：**{window_start} ~ {today_str}**（最近 {lookback_days} 天）。每条广告顶层的 "
+        f"spend / impressions / purchase / purchase_value / roas / ctr / cpm / frequency 都是**这 {lookback_days} 天的合计**，"
+        "既不是全历史累计、也不是今天的数字。reason 里提到花费时必须按这个口径说。\n"
+        "  · daily_spend 覆盖窗口内**每一天**（自该广告创建日起），**包括没花钱的天**："
+        "某天写成 `date + spend:0` 就是**当天真实零花费**（被暂停 / 预算耗尽 / 没跑起来 / 审核没过），"
+        "**不是数据缺失**，必须当成事实用。\n"
+        "  · 判断动作看**最近几天**的走势（爬升 / 持平 / 断崖），不要被窗口合计掩盖近期恶化。\n"
+        "  · 若 daily_spend 最后一天（即今天）spend 为 0：说明它今天没在花钱 —— 此时**不需要 pause**"
+        "（它本来就没花），给 observe 即可，但要在 reason 里点出「从哪天起停了」。\n"
+        + note_text +
+        f"【硬性要求】必须对输入中的**每一条**广告都输出一条结论，共 **{n} 条**，一条不能少、不能合并、不能跳过。\n"
+        "  表现正常、不需要动作的也必须输出，action 填 \"observe\"。宁可全给 observe，也绝不能漏掉任何一条 ——"
+        "漏掉等于这条广告没被判断过。\n"
+        "daily_spend 逐日字段含义（某天缺哪个字段，就代表那天该项为 0；某天只有 date+spend:0 表示当天没投）：\n"
+        "  date 日期 / spend 当天花费 / impressions 展示 / clicks 链接点击 / ctr 当天点击率% / cpm 当天千展成本 /\n"
+        "  reach 覆盖人数 / frequency 频次 / add_to_cart 加购 / initiate_checkout 结账发起 /\n"
+        "  add_payment_info 添加支付信息 / view_content 内容查看 / purchase 购买 / purchase_value 购买价值 / roas 当天ROAS\n"
+        "  → 逐日序列就是这条广告的生命周期，要读出：花费在爬还是在跌、哪天出现断崖、\n"
+        "    加购→结账→支付→购买哪一环开始断、ctr 是否逐日衰减（素材疲劳）、frequency 是否快速堆高（受众见顶）\n"
+        "每条广告顶层的 **sample** 字段是**程序已经算好的样本量，直接引用，绝对不要自己数逐日明细去算**"
+        "（自己数会数错）：\n"
+        "  days 窗口天数 / days_with_orders 出单天数 / orders_total 总单数 / days_spend_no_order 花了钱但零单的天数 /\n"
+        "  last3_days 最近3天天数 / last3_spend 最近3天花费 / last3_orders 最近3天单数 / last3_roas 最近3天ROAS /\n"
+        "  longest_zero_order_streak 最长「连续有花费且零单」的天数 / first_order_date 首次出单日期\n"
+        "  → 凡提到样本量，**必须用统一句式**：「X天里出Y单（出单天数Z）」——X=days、Y=orders_total、Z=days_with_orders，\n"
+        "    数字一律取自 sample，不要自己从 daily_spend 里数。\n"
+        "  → **必须单独看最近三天**（last3_*）：最近三天在恶化（单数掉/ROAS 掉/花费断）和最近三天在往上走，\n"
+        "    结论完全不同。窗口合计漂亮但最近三天已经垮掉的，**不算好**；窗口合计一般但最近三天明显转好的，要指出来。\n"
+        "每条广告顶层的 **net_view** 字段是**程序已经算好的钱账**，直接引用，不要自己从逐日明细加总：\n"
+        "  spend 窗口花费 / revenue 窗口回收 / net 净额（=revenue−spend，正=赚、负=亏；**不含商品成本**，\n"
+        "  只用来判断这笔广告本身投得值不值）/ roas / active_days 有花费天数 /\n"
+        "  fill_rate 顶格率（花费打满日预算的天数占比；接近 1 = 预算卡住了它，不是它跑不动）/ \n"
+        "  freq_first、freq_last 首末频次（涨得快 = 受众在见顶，放量空间小）/ cum_net_min 累计净额最低点 /\n"
+        "  cum_negative_since 累计净额首次转负的日期（这条广告该止损的锚点）\n"
+        "  → **关停这个动作，第一判据是 net_view.net 的正负，不是「有没有出单」**：\n"
+        "    net ≤ 0 = 这段没赚钱，放量救不了亏损；反过来 net > 0 **不构成** pause 的理由（那是在赚钱的广告）。\n"
+        "  → **「几天零单」本身不是关停依据**：点击量不够时零单会自然发生（实测某广告按它自己的转化率，\n"
+        "    连着两天零单的概率就有 29.9%），必须落到 net_view.net 上再下结论。\n"
+        "    （以上两条只约束 pause / decrease_budget 的判断，**不改变**下面关于 increase_budget 的样本要求。）\n"
+        "判断方法（人肉式投放经验，综合多指标判断，必须遵守）：\n"
+        "1. 先看 budget_type 和 ad_type 决定判断框架：\n"
+        "   - budget_type=ABO：预算是广告组级（adset_daily_budget），单个广告的预算独立，调整预算直接影响这个广告\n"
+        "   - budget_type=CBO：预算是系列级（campaign_daily_budget），系列内广告共享预算，调整系列预算影响整个系列，单广告的增减建议要谨慎（可能只是系统分配问题）\n"
+        "   - ad_type=DPA 动态商品广告：按商品维度衡量，看商品点击/购买，不看单广告素材\n"
+        "   - ad_type=ASC 或基础：常规判断\n"
+        "2. 再看 objective（目标）决定看什么指标：\n"
+        "   - OUTCOME_SALES/OUTCOME_CONVERSIONS（销量/转化）广告：看完整转化漏斗（view_content 内容查看 -> add_to_cart 加购 -> initiate_checkout 结账发起 -> add_payment_info 添加支付 -> purchase 购买），以及 ROAS、cost_per_purchase、cart_to_purchase_rate（加购转购买率）、CTR\n"
+        "     * 漏斗哪一环掉得厉害（比如加购多但购买少 -> 加购转购买率低，是落地页/价格问题不是广告问题）\n"
+        "     * 有加购/结账但没有最终购买：说明流量质量可以，转化环节有问题，先观察或减预算，不急着暂停\n"
+        "     * 连加购/点击都没有的高花费广告：流量质量差，考虑暂停\n"
+        "   - OUTCOME_ENGAGEMENT（互动）广告：看 CTR、CPM、互动成本（post_engagement 互动数）+ frequency 频次（频次过高=受众疲劳）；不看购买；零购买正常，互动成本合理就继续\n"
+        "   - OUTCOME_TRAFFIC（流量）广告：看 CPC、CTR、landing_page_view 落地页查看 + frequency，不看购买\n"
+        "   - 无 objective 或未知：按销量广告看待\n"
+        "3. 用 reach（覆盖）和 frequency（频次）辅助判断：\n"
+        "   - reach 接近 impressions 且 frequency 低（约1）：触达广、单人次曝光少，正常\n"
+        "   - frequency 高（>3）：受众重复曝光多，可能有广告疲劳，考虑换素材/人群；转化还好则继续，转化差则警惕\n"
+        "4. 时间维度：**以 daily_spend 为准**。逐日看花费曲线（爬升/持平/断崖）、逐日看转化出现的位置（第几天才出第一单）、逐日看 ctr 与 frequency 走势。"
+        "**每条都要点出最近三天（sample.last3_*）的方向**：在变好还是变坏。只有 1 天数据则按单日判断并说明数据量不足\n"
+        "5. 判断倾向（由你自己权衡，不设硬阈值，但必须遵守下面关于「证据强度」的要求）：\n"
+        "   - 连续多日高花费零任何转化（连加购/点击都没有）-> 暂停\n"
+        "   - 加购/结账有但购买转化率低 -> 观察或减预算（可能落地页问题）\n"
+        "   - 数据太少**且看不出明显亏损** -> 观察（注意：亏钱是明确信号，见本条第 3 项，不能拿「数据少」把它盖过去）\n"
+        "   - 加预算是这里**唯一会真花钱**的动作，只有证据足够才给 increase_budget。"
+        "「表现好」不等于「稳定」，判「稳定」**以 daily_spend 为准**（数一数有几天出了购买、"
+        "有几天 ROAS 明显高于其他天）：\n"
+        "     * 「稳定」= **多日方向一致** —— 连续若干天都有转化、ROAS 在同一量级，**不是某一天冲高**。\n"
+        "     * **单日高点不是稳定**：若这条广告只有 1 天数据、或整条只成交过一两单，它的高 ROAS "
+        "极可能是一两笔大额订单或偶然成交撑起来的 —— 那是噪声，不是投放能力。"
+        "此时给 observe，并在 reason 里点明样本不足，**不要给 increase_budget**。\n"
+        "     * **凡给 increase_budget，reason 必须写出你依据的样本量 + 最近三天表现**，"
+        "格式如「7天里出16单（出单天数6），近三天5单 ROAS 6.8」—— 数字一律取自 sample 字段"
+        "（days / orders_total / days_with_orders / last3_orders / last3_roas），**不要自己数**。"
+        "写不出样本量，就说明你其实没有把握 —— 那就给 observe。\n"
+        "   - **⚠️ 上面这两条「要有样本」「写不出就给 observe」只约束 increase_budget —— 它们只在"
+        "「要不要多花钱」这个问题上生效。反过来不成立：判断该不该 pause / decrease_budget 时，"
+        "绝对不能拿「样本少 / 数据不足 / 数据量有限」当 observe 的理由。**\n"
+        "     亏损趋势本身就是证据：连续多日零购买却持续花钱、ROAS 明显低于 1、花费在爬而转化在断 —— "
+        "这些恰恰是样本再多也只会更糟的形态，**该停就停**。对这种广告给 observe，等于批准它继续烧钱。\n"
+        "6. 每条广告**恰好一条**建议（不要给同一条广告写两条）\n"
+        "7. reason 要具体，说明：目标/预算类型 + 看了哪些指标（逐日走势、漏斗哪一环断、ctr/frequency）+ 结论。"
+        "**控制在一句话内（约 60~80 字）** —— 一次要输出很多条，写太长会导致响应被截断、后面的广告拿不到结论\n"
+        "8. 【最后强调】输出数组的长度必须**等于输入的广告条数**，一条都不能少\n"
+        "只输出 JSON 数组，不要输出任何其他文字，格式：\n"
+    ) + (
+        '[{"campaign_id":"123","action":"pause|increase_budget|decrease_budget|observe",'
+        '"budget_change_pct":20,"reason":"..."}]'
+        "\n\n业务规则:\n" + rules_text +
+        "\n\n数据快照（共 " + str(n) + " 条，请输出 " + str(n) + " 条结论）:\n" + snap_text
+    )
+
+
+# ---------- LLM 调用（OpenAI 兼容） ----------
+def call_llm(base_url, api_key, model, prompt, timeout=60):
+    """
+    调 9router / OpenAI 兼容 chat/completions，返回模型输出文本。
+    失败抛异常（由调用方处理）。
+    """
+    import requests
+
+    if not base_url or not api_key:
+        raise ValueError("未配置 base_url / api_key（AI 决策不可用）")
+    url = base_url.rstrip('/') + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你是一个只输出 JSON 的 API 端点。禁止输出任何解释、思考过程、markdown 代码块或额外文字，直接输出合法 JSON 数组。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,   # 低温度，输出稳定
+        # ⚠️ 原值 max_tokens=2000 会被思考链吃光：实测 3 条广告 reasoning_tokens 就 4380，
+        #    响应全文是推理文字、JSON 从未输出 -> parse_suggestions 恒为 []（即「STDS 返回 0 条建议」）。
+        #    修正：上限提到 8000，并用 enable_thinking=False 直接关掉思考链（实测 43.6s -> 9.3s，思考 token 归零）。
+        "max_tokens": 8000,
+        "enable_thinking": False,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"LLM HTTP {resp.status_code}: {resp.text[:300]}")
+    # 网关可能不返回 charset，默认会按 ISO-8859-1 解码导致中文乱码：强制 utf-8
+    try:
+        text = resp.content.decode('utf-8', errors='replace')
+    except Exception:
+        text = resp.text or ""
+    ctype = resp.headers.get('Content-Type', '')
+    if 'event-stream' in ctype or text.lstrip().startswith('data:'):
+        # 兼容：整包 JSON + data:[DONE] 尾巴 / 标准 SSE 多块 / 纯整包
+        chunks = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('data:'):
+                payload = line[5:].strip()
+                if payload and payload != '[DONE]':
+                    chunks.append(payload)
+            elif not line.startswith(':'):
+                chunks.append(line)
+        for cand in chunks:
+            try:
+                data = json.loads(cand)
+                msg = data["choices"][0]["message"]
+                content = msg.get("content") or ""
+                if not content:
+                    # 偶发：STDS 只输出 reasoning_content（思维链），content 空
+                    content = msg.get("reasoning_content") or ""
+                if content:
+                    return content
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                continue
+        raise RuntimeError(f"LLM SSE 响应无法解析: {text[:300]}")
+    # 纯 JSON
+    data = resp.json()
+    try:
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or ""
+        if not content:
+            content = msg.get("reasoning_content") or ""
+        if not content:
+            raise RuntimeError("LLM 响应 content 为空")
+        return content
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"LLM 响应格式异常: {str(data)[:300]}")
+
+
+# ---------- 解析模型输出 ----------
+def _recover_json_array(text):
+    """
+    当整体 json.loads 失败时，尝试逐条恢复 JSON 数组元素。
+    做法：按 ',' 粗切分，逐段尝试 json.loads，能解析的留下。
+    返回 list[dict]；一条都没有返回 []。
+    """
+    items = []
+    # 去掉外层 [ ]
+    body = text.strip()
+    if body.startswith('['):
+        body = body[1:]
+    if body.endswith(']'):
+        body = body[:-1]
+    # 按行切（STDS 输出每条对象通常独立成段）
+    lines = body.split('\n')
+    cur = ''
+    for line in lines:
+        cur += line + '\n'
+        s = cur.strip().rstrip(',')
+        if s.startswith('{') and s.endswith('}'):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    items.append(obj)
+            except json.JSONDecodeError:
+                pass
+            cur = ''
+    return items
+
+
+def parse_suggestions(text):
+    """
+    从模型输出文本中提取建议列表。容忍输出包含 markdown 代码块/多余文字。
+    返回 [{campaign_id, action, budget_change_pct, reason}]
+    """
+    if not text:
+        return []
+    # 去掉 ```json ... ``` 包裹（用贪婪匹配到最后一个 ]，避免嵌套/换行截断）
+    m = re.search(r"```(?:json)?\s*(\[.*\])\s*```", text, re.S)
+    if m:
+        text = m.group(1)
+    text = text.strip()
+    # 从后往前找 JSON 数组：STDS 可能在思考过程中先写了几个半成品 JSON，
+    # 真正的完整 JSON 数组在最后（用 rfind 抓最后一个 [ 到最后一个 ]）
+    start = text.rfind('[')
+    end = text.rfind(']')
+    if start == -1 or end == -1 or end < start:
+        return []
+    # 如果最后一个 [ 到 ] 解析失败，回退：从最后一个 [ 往前再找更早的候选
+    data = None
+    for probe_start in (start, text.rfind('[', 0, start), text.find('[')):
+        if probe_start == -1 or probe_start >= end:
+            continue
+        try:
+            data = json.loads(text[probe_start:end + 1])
+            if isinstance(data, list):
+                break
+        except json.JSONDecodeError:
+            continue
+    if data is None:
+        data = _recover_json_array(text[start:end + 1])
+    suggestions = []
+    # 兼容中英文动作词
+    valid_actions = {'pause': 'pause',
+                     'increase_budget': 'increase_budget',
+                     'decrease_budget': 'decrease_budget',
+                     'observe': 'observe',
+                     '暂停': 'pause',
+                     '加预算': 'increase_budget',
+                     '减预算': 'decrease_budget',
+                     '观察': 'observe',
+                     '不动': 'observe',}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get('campaign_id', '')).strip()
+        action = str(item.get('action', '')).strip().lower()
+        if not cid or action not in valid_actions:
+            continue
+        suggestions.append({
+            'campaign_id': cid,
+            'action': valid_actions[action],
+            'budget_change_pct': int(item.get('budget_change_pct') or 0),
+            'reason': str(item.get('reason', '')),
+        })
+    return suggestions
+
+
+# ---------- 输出护栏（已撤，默认不生效）----------
+def apply_guardrails(suggestions, snapshots, config):
+    """
+    原「第 3 层硬护栏」：把 AI 给出的预算调幅夹取到 max_budget_change_pct 以内。
+
+    2026-09-30 用户决定撤掉规则层、让 AI 全权判断：
+      ENABLE_BUDGET_CAP = False（默认）时不做任何幅度夹取，AI 说多少就是多少。
+
+    仍然保留的唯一处理（属工程必需，不是规则判断）：
+      - 同一对象同一轮只保留第一条建议（否则同一条广告会出现互相冲突的两条建议）
+
+    如需恢复夹取，把本模块顶部的 ENABLE_BUDGET_CAP 改成 True 即可。
+    """
+    out = []
+    seen = set()
+    max_pct = config.get('max_budget_change_pct', 20)
+
+    for s in suggestions:
+        cid = str(s['campaign_id'])
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if ENABLE_BUDGET_CAP and s['action'] in ('increase_budget', 'decrease_budget'):
+            pct = abs(s.get('budget_change_pct') or 0)
+            if pct > max_pct:
+                s['reason'] = f"{s['reason']}（幅度{pct}%超上限{max_pct}%，已限为{max_pct}%）"
+                s['budget_change_pct'] = max_pct if s['action'] == 'increase_budget' else -max_pct
+        out.append(s)
+    return out
+
+
+# ---------- 关停护栏 & 加预算提名（2026-10-02）----------
+ACTION_CN = {'pause': '暂停', 'increase_budget': '加预算',
+             'decrease_budget': '减预算', 'observe': '观察'}
+STOP_ACTIONS = ('pause', 'decrease_budget')   # 业务上都是「往下压」，护栏按同一口径处理
+
+
+def _row_index(snapshots):
+    return {str(r.get('id')): r for r in (snapshots or []) if r.get('id') is not None}
+
+
+def enforce_risk_guardrails(suggestions, snapshots, config):
+    """
+    关停护栏（硬）+ 加预算提名（软）。
+
+    ⚠️ 必须在「覆盖率兜底：输入 N 条 → 输出 N 条」**之后**调用。
+       否则模型漏答 / 整批失败的那几条会被兜底补成 observe，直接绕过护栏 ——
+       这正是它没有并进 apply_guardrails 的原因（那个函数在兜底之前跑）。
+
+    做两件事：
+
+    1) 关停护栏 —— 直接改 action
+       · 止损线：net_view.net ≤ KILL_STOP_NET → 强制 pause
+         （AI 若是 observe / increase_budget，在这里被换掉）
+       · 禁杀线：net_view.net >  KILL_STOP_NET → 禁止 pause / decrease_budget，降级为 observe
+       两条线互补，正好盖住两类错：该停没停（漏杀）、不该停却停了（误杀）。
+
+    2) 加预算提名 —— **默认不改 action**，只挂 nomination 字段 + 在 reason 里加一句
+       条件：net > 0（在赚）+ 顶格率 ≥ 阈值（预算卡住了它）+ 末段频次 < 阈值（受众没看腻）
+             + 窗口天数 ≥ 下限（少样本的高 ROAS 是噪声，不是投放能力）
+       设 config['nominate_apply'] = True 可让规则直接代替 AI 动作（**不要默认开** ——
+       关于加钱这件事，默认姿态是「规则提名、人拍板」）。
+
+    没有 net_view 的条目（例如没拿到逐日明细）保持不变，护栏不出手。
+
+    返回 (suggestions, stats)。
+    """
+    stats = {'forced_pause': 0, 'blocked_kill': 0, 'nominated': 0, 'no_net': 0}
+    if not suggestions:
+        return suggestions, stats
+
+    idx = _row_index(snapshots)
+    stop_net = float(config.get('kill_stop_net', KILL_STOP_NET))
+    fill_min = float(config.get('nominate_fill_rate', NOMINATE_FILL_RATE))
+    freq_max = float(config.get('nominate_freq_max', NOMINATE_FREQ_MAX))
+    min_days = int(config.get('nominate_min_days', NOMINATE_MIN_DAYS))
+    apply_nom = bool(config.get('nominate_apply', False))
+    nom_pct = int(config.get('max_budget_change_pct', 20) or 20)
+
+    for s in suggestions:
+        row = idx.get(str(s.get('campaign_id'))) or {}
+        nv = row.get('net_view') or {}
+        net = nv.get('net')
+        act = s.get('action')
+        if net is None:
+            stats['no_net'] += 1
+            continue
+        net = float(net)
+
+        # ---------- 1) 关停护栏 ----------
+        if net <= stop_net:
+            if act not in STOP_ACTIONS:
+                _sp, _rv = nv.get('spend'), nv.get('revenue')
+                _money = ('（花费 %.2f / 回收 %.2f）' % (float(_sp), float(_rv))
+                          if _sp is not None and _rv is not None else '')
+                s['ai_action'] = act
+                s['action'] = 'pause'
+                s['budget_change_pct'] = 0
+                s['guardrail'] = 'forced_pause'
+                s['reason'] = ('【护栏·止损】可见窗口净额 %+.2f%s ≤ %.2f：'
+                               '这段没赚钱，放量救不了亏损 → 强制暂停（AI 原判「%s」）。原理由：%s'
+                               % (net, _money, stop_net, ACTION_CN.get(act, act), s.get('reason', '')))
+                stats['forced_pause'] += 1
+            continue      # 已经在停，不需要再谈加钱
+
+        if act in STOP_ACTIONS:
+            s['ai_action'] = act
+            s['action'] = 'observe'
+            s['budget_change_pct'] = 0
+            s['guardrail'] = 'blocked_kill'
+            s['reason'] = ('【护栏·禁杀】可见窗口净额 %+.2f > %.2f，这段在赚钱 → 禁止关停，'
+                           '降级为观察待人工复核（AI 原判「%s」）。原理由：%s'
+                           % (net, stop_net, ACTION_CN.get(act, act), s.get('reason', '')))
+            stats['blocked_kill'] += 1
+
+        # ---------- 2) 加预算提名（默认只提名，不改动作）----------
+        if not ENABLE_BUDGET_NOMINATION or act == 'increase_budget':
+            continue
+        fr = nv.get('fill_rate')
+        fl = nv.get('freq_last')
+        if fr is None or fl is None:
+            continue
+        fr, fl = float(fr), float(fl)
+        if not (fr >= fill_min and fl < freq_max and int(nv.get('days') or 0) >= min_days):
+            continue
+        s['nomination'] = {
+            'suggested_action': 'increase_budget',
+            'rule': 'net>%.2f 且 顶格率>=%.2f 且 末段频次<%.2f 且 天数>=%d'
+                    % (stop_net, fill_min, freq_max, min_days),
+            'net': round(net, 2), 'fill_rate': fr, 'freq_last': fl,
+            'applied': apply_nom,
+        }
+        tail = ('【提名·加预算】净额 %+.2f 在赚、顶格率 %.2f（预算卡住了它）、末段频次 %.2f'
+                '（受众还没看腻）→ 建议人工复核是否加预算'
+                % (net, fr, fl))
+        if apply_nom:
+            s['ai_action'] = act
+            s['action'] = 'increase_budget'
+            s['budget_change_pct'] = nom_pct
+            s['guardrail'] = 'rule_increase'
+            tail += '（已按规则直接加 %d%%）' % nom_pct
+        else:
+            tail += '（本条未自动改动作）'
+        s['reason'] = ('%s｜%s' % (s.get('reason', ''), tail))
+        stats['nominated'] += 1
+
+    return suggestions, stats

@@ -1,0 +1,37 @@
+# 密钥 / 本机配置
+ai_config.json
+config.local.json
+*.key
+.env
+
+# 跑出来的中间产物
+_out/
+ai_test_history.json
+ai_test_zero_spend_skipped.json
+ai_history.json
+*.log
+
+# 真实账户数据（绝不入库）
+real_ad_*.csv
+ads.rule
+
+# 缓存
+__pycache__/
+*.pyc
+
+# 复跑脚本时会在根目录重新落一份输出；权威副本在 docs/evidence/（根锚定，不影响那里）
+/_test_guard_out.txt
+/_test_guard_edge_out.txt
+/_test_guard_run.txt
+/_v11_fairness_out.txt
+/_v11_analyze_out.txt
+/_v11_ceiling_up_out.txt
+/_v12_history_out.txt
+/_v12_compare_out.txt
+/_solvability_v5_out.txt
+/gen_v5_out.txt
+/_case_out_*.txt
+
+# 模型权重
+_laya_model/
+_laya_result.json

@@ -1,0 +1,19 @@
+=== _lint_unbound.py ===
+=== fb_ai_engine.py  干净 ===
+=== fb_ai_scheduler.py  干净 ===
+
+合计 0 处可疑
+
+=== _lint_dupdef.py ===
+  OK   fb_ai_engine.py
+  OK   fb_ai_scheduler.py
+
+重复定义合计：0 处
+
+=== _lint_attrs.py ===
+  OK   fb_ai_engine.py
+  OK   fb_ai_scheduler.py
+
+未定义属性合计：0 处
+
+（三个检查都是本仓自研：pyflakes 抓不到的未绑定变量 / 同名覆盖 / self 属性拼错。误报已修到 0。）
