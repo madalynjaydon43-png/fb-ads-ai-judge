@@ -44,8 +44,34 @@ ENABLE_BUDGET_NOMINATION = True  # 加预算规则提名（**只提名，不改 
 
 KILL_STOP_NET = 0.0       # 止损线：可见窗口净额 ≤ 此值 → 强制暂停（这段没赚钱，放量救不了亏损）
 NOMINATE_FILL_RATE = 0.90  # 提名线①：顶格率 ≥ 此值 —— 预算卡住了它，不是它跑不动
-NOMINATE_FREQ_MAX = 1.35   # 提名线②：末段频次 < 此值 —— 受众还没看腻，还有没触达的人
+NOMINATE_FREQ_MAX = 1.35   # 提名线②（**旧值，已被 ③ 取代，保留仅为兼容旧 config**）
+NOMINATE_FREQ_SATURATED = 3.5   # 提名线②：末段频次 < 此值才算「受众还没看腻」
+                                #   🔴 原值 1.35 是在 v5 数据上拟合的，换数据立刻失真 ——
+                                #   双盲实测：频次 2.4（远未饱和、加预算后 ROAS 反而升到 4.64）的那条
+                                #   提名数 = 0。**饱和线是有行业共识的量（3~3.5），拟合值没有。**
+NOMINATE_FREQ_GROWTH_MAX = 0.5  # 提名线③：频次增幅（末−首）≤ 此值 —— 没在快速堆高
 NOMINATE_MIN_DAYS = 3      # 样本下限：窗口不足这么多天不提名（少样本的高 ROAS 是噪声）
+
+# ---------- 护栏前置条件（2026-10-03 双盲实测后加） ----------
+# 🔴 为什么需要：止损线只看 `net = 购买价值 − 花费`，**不看口径列、不看样本量、不看亏损是「哪一环」造成的**。
+#   双盲实测里它把两条本不该关的广告一刀切停：
+#     · 优化目标是 add_to_cart 的那条（加购 280 个、$2.14/个，加购极健康）
+#     · 只点了 50 次、零单的那条（零单在这个样本量下是正常现象）
+#   加上 T-05/T-06 两轮都被误判关停 ⇒ 误杀率 40% / 60%。
+#   ⇒ 命中任一条时，护栏**不越权强制**，把判断交回 AI（并在 reason 里写明是哪一条）。
+#   ⚠️ 护栏**只管「AI 没判停但净额为负」这个方向**；AI 自己判了 pause 的，护栏本来就不动 ——
+#   所以前置条件不会「放过该关的广告」，它只阻止「护栏替 AI 做它不该做的决定」。
+STOP_MIN_CLICKS = 100         # 点击数 < 此值 ⇒ 零单是样本不足，不构成止损依据
+                                #   🔴 原先取 30，双盲重放**当场翻车**：T-02 有 50 次点击、0 单，
+                                #   AI 判的是「观察」（理由：累计到 100 次点击仍 0 单才关），
+                                #   结果被护栏强制暂停 ⇒ 误杀从 2/40% 涨到 3/60%。
+                                #   门槛必须定在「这个样本量下 0 单才有意义」的位置，不是随手取整。
+STOP_MIN_LOSS_ABS = None      # 🔴 **已否决、不启用**（保留常量名以说明为什么不加）。
+                                #   「亏 50 美元就关」是噪音；但「亏 50 美元就永远不管」是更大的错 ——
+                                #   每天只花 $5、每天亏 $3 的广告会因此永远不被止损线关掉。
+STOP_WATCH_SEC_LOW = 3.0       # 平均观看 < 此秒 ⇒ 只被开头钩住（素材问题，不是流量问题）
+STOP_REPEAT_CLICK_HIGH = 0.30  # 重复点击占比 > 此值 ⇒ 少数人反复点（落地页/信任问题）
+STOP_ACTIVE_STATUS = ('ACTIVE',)   # 只有真正在投的才谈得上「止损」
 
 # ---------- 配置 ----------
 AI_CONFIG_DEFAULTS = {
@@ -342,6 +368,47 @@ def make_snapshot(campaigns_insights):
     return rows
 
 
+def _flag_section(snapshot):
+    """按本批快照的实际内容，**逐条点名**那些容易被忽略的强信号。
+
+    🔴 为什么不只写在字段说明里（2026-10-03 双盲实测）：
+       `repeat_click_ratio` 的规则早就写进 prompt 了，但两轮盲测**没有一条提到它** ——
+       28 列里它不显眼，而「918 次点击 0 单」是个强得多的信号，直接把它压过去了。
+       **信号存在 ≠ 会被用。** 埋得再深也是埋着。
+       ⇒ 命中阈值的条目，在这里按名字单独点名，要求模型在 reason 里正面回应。
+    """
+    RC = 0.30
+    SEC = 3.0
+    rows = []
+    for r in (snapshot or []):
+        nm = r.get('name') or r.get('id') or '(无名)'
+        rc = r.get('repeat_click_ratio')
+        sec = r.get('video_avg_watch_sec')
+        notes = []
+        if rc is not None:
+            try:
+                if float(rc) > RC:
+                    notes.append('非独立点击占比 %.0f%%（>%.0f%%）⇒ 少数人反复点，'
+                                 '**病根在落地页/价格/信任，不在曝光**'
+                                 % (float(rc) * 100.0, RC * 100.0))
+            except (TypeError, ValueError):
+                pass
+        if sec is not None:
+            try:
+                if 0 < float(sec) < SEC:
+                    notes.append('平均观看仅 %.1f 秒（<%.1f 秒）⇒ **素材只钩住了开头**，'
+                                 '该换素材/重写前 3 秒，不是调出价或砍预算' % (float(sec), SEC))
+            except (TypeError, ValueError):
+                pass
+        if notes:
+            rows.append('  · **%s**：%s' % (nm, '；'.join(notes)))
+    if not rows:
+        return ''
+    return ('\n【本批里这几条有强信号 —— 必须在 reason 里正面回应，不许当作没看见】\n'
+            + '\n'.join(rows)
+            + '\n  → 出现这些信号时，**先怀疑某一环坏了，而不是先怀疑「没人要」**。\n')
+
+
 def build_prompt(snapshot, config, window=None):
     """
     构造发给 LLM 的 prompt。config 是完整配置（含业务规则阈值）。
@@ -429,6 +496,20 @@ def build_prompt(snapshot, config, window=None):
         "问题在落地页 / 价格 / 信任，**不在素材曝光**。"
         "**它是「往下一环排查」的信号，不是独立的关停理由**：不得仅凭它就给 pause / decrease_budget，"
         "必须结合 net_view.net 的正负再定。\n"
+        "  · 🔴 **判「亏」之前必须先判「亏在哪」—— 净亏有两种，处置完全相反**：\n"
+        "      (a) **买不到有效流量**：落地页到达率、加购率都正常，就是没人买"
+        "（加购率低 + 各环通过率没有异常断层）\n"
+        "          → 这是流量白买，**pause / decrease_budget 是对的**。\n"
+        "      (b) **流量买到了但接不住**：落地页到达率或加购率**明显偏高/正常**，"
+        "但后面某一环通过率**异常低**（如加购→结账、加购→支付），"
+        "或存在 video_avg_watch_sec < 3、repeat_click_ratio > 0.3 这类信号\n"
+        "          → 这是**某一环坏了**，该做的是修那一环（换素材 / 查结账体验 / 查落地页），\n"
+        "            **pause 会把「已经买到的流量」连同它的优化空间一起扔掉**。\n"
+        "    判别办法（按顺序看，别只看净额）：落地页到达量 → 加购率 → 逐环通过率 → 观看/重复点击信号。"
+        "**如果断层出现在某一环中间，就不是「买不到人」，是「人来了没接住」。**"
+        "这种情况下 reason 必须写明「断层在第几环、这一环的通过率是多少」，"
+        "而不是只说「亏损所以关停」。\n"
+        + _flag_section(snapshot)
         + note_text +
         f"【硬性要求】必须对输入中的**每一条**广告都输出一条结论，共 **{n} 条**，一条不能少、不能合并、不能跳过。\n"
         "  表现正常、不需要动作的也必须输出，action 填 \"observe\"。宁可全给 observe，也绝不能漏掉任何一条 ——"
@@ -718,6 +799,85 @@ def _row_index(snapshots):
     return {str(r.get('id')): r for r in (snapshots or []) if r.get('id') is not None}
 
 
+def _stop_precondition(row, nv, config):
+    """止损线的前置条件。命中任一条 ⇒ **不要替 AI 强制关停**，交回它判断。
+
+    返回 (是否阻止, 命中的条件说明)。没命中返回 (False, '')。
+
+    每条都对应一个实测误杀，不是假想风险（2026-10-03 双盲，8 条造 10 天只给 5 天）：
+
+    1. **不在投** —— status 非 ACTIVE（已暂停/预算耗尽/审核不过）。
+       它本来就没花钱，pause 没有对象；这条是最基本的常识，护栏却原来不认。
+    2. **优化目标不是购买** —— optimization_event 是 add_to_cart / initiate_checkout 等。
+       平台在**为加购找人**，购买数少是目标决定的，不是它跑坏了。
+    3. **样本不足** —— 累计点击 < STOP_MIN_CLICKS。
+       按它自己的转化率算，期望单数不到 1 ⇒ 零单是**正常现象**，不是止损依据。
+    4. **亏损来自「接不住」而不是「买不到」** —— 两个可观测信号：
+       · 平均观看 < 3 秒（素材在开头就把人筛掉了）
+       · 重复点击占比 > 30%（少数人反复点 = 落地页/价格/信任问题）
+       这两种情况下净额为负是**某一环坏了**的表现，该修那一环；直接关停治不好它，
+       还会把一个「流量已经买到了」的渠道砍掉。
+    """
+    st = str(row.get('status') or '').strip().upper()
+    if st and st not in STOP_ACTIVE_STATUS:
+        return True, ('它当前 %s（不在投）—— 本来就没在花钱，关停没有对象，'
+                      '该问的是「为什么停了」而不是「要不要停」' % st)
+
+    opt = str(row.get('optimization_event') or '')
+    if opt and 'purchase' not in opt:
+        short = opt.split('.')[-1] if '.' in opt else opt
+        return True, ('它的成效指标是 %s，不是 purchase —— 平台在**为 %s 找人**，'
+                      '购买数少是目标决定的，不是它跑坏了' % (opt, short))
+
+    try:
+        clicks = float(row.get('clicks') or 0)
+    except (TypeError, ValueError):
+        clicks = None
+    min_clicks = float(config.get('stop_min_clicks', STOP_MIN_CLICKS) or STOP_MIN_CLICKS)
+    if clicks is not None and 0 < clicks < min_clicks:
+        return True, ('窗口内只有 %g 次点击（< %g）—— 按它自己的转化率，期望单数不到 1 单，'
+                      '**零单是样本不足的正常现象**，不构成止损依据'
+                      % (clicks, min_clicks))
+
+    # ⚠️ 这里**曾经**还有一条「亏损绝对额 < 100 ⇒ 不止损」，已**主动否决**（2026-10-03）。
+    #    它确实能多拦一条小额亏损，但副作用更糟：一条每天只花 $5、每天亏 $3 的广告
+    #    会因为「亏得不够多」而**永远不会被止损线关掉** —— 小预算持续失血是真金白银在烧。
+    #    「亏 50 美元就关」是噪音；但「亏 50 美元就永远不管」是更大的错。
+    #    样本量那一条（stop_min_clicks）已经把「零单但样本不足」这个真实误杀挡住了，够了。
+    min_loss = None
+    if min_loss is not None and abs(nv.get('net') if nv.get('net') is not None else 0.0) < min_loss:
+        return True, ('亏损绝对额只有 %.2f（< %.2f）—— 钱不够本，停掉也没有可回收的优化空间，'
+                      '**这不叫止损，叫噪音**' % (abs(float(nv.get('net') or 0.0)), min_loss))
+
+    sec = row.get('video_avg_watch_sec')
+    sec_low = float(config.get('stop_watch_sec_low', STOP_WATCH_SEC_LOW) or STOP_WATCH_SEC_LOW)
+    if sec is not None:
+        try:
+            sec = float(sec)
+        except (TypeError, ValueError):
+            sec = None
+    if sec is not None and 0 < sec < sec_low:
+        return True, ('平均观看只有 %.1f 秒（< %.1f 秒）⇒ 素材只钩住了开头、后半段留不住人，'
+                      '**这是素材问题不是流量问题**，该换素材；直接关停等于把「已经买到的流量」连同'
+                      '优化空间一起扔掉' % (sec, sec_low))
+
+    rc = row.get('repeat_click_ratio')
+    rc_high = float(config.get('stop_repeat_click_high', STOP_REPEAT_CLICK_HIGH)
+                    or STOP_REPEAT_CLICK_HIGH)
+    if rc is not None:
+        try:
+            rc = float(rc)
+        except (TypeError, ValueError):
+            rc = None
+    if rc is not None and rc > rc_high:
+        return True, ('非独立点击占比 %.0f%%（> %.0f%%）⇒ **少数人在反复点**，'
+                      '是落地页/价格/信任没接住，不是「没人感兴趣」；'
+                      '减预算和关停都治不了它，该查的是转化那一环'
+                      % (rc * 100.0, rc_high * 100.0))
+
+    return False, ''
+
+
 def enforce_risk_guardrails(suggestions, snapshots, config):
     """
     关停护栏（硬）+ 加预算提名（软）。
@@ -744,14 +904,21 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
 
     返回 (suggestions, stats)。
     """
-    stats = {'forced_pause': 0, 'blocked_kill': 0, 'nominated': 0, 'no_net': 0}
+    stats = {'forced_pause': 0, 'blocked_kill': 0, 'nominated': 0, 'no_net': 0,
+             'blocked_by_precondition': 0}
     if not suggestions:
         return suggestions, stats
 
     idx = _row_index(snapshots)
     stop_net = float(config.get('kill_stop_net', KILL_STOP_NET))
     fill_min = float(config.get('nominate_fill_rate', NOMINATE_FILL_RATE))
-    freq_max = float(config.get('nominate_freq_max', NOMINATE_FREQ_MAX))
+    # 🔴 提名线②：默认用**饱和线**（有行业共识），不再用 v5 拟合出来的 1.35。
+    #    config 里若显式写了 nominate_freq_max 仍以它为准（保留旧配置的兼容）。
+    if 'nominate_freq_max' in (config or {}):
+        freq_max = float(config.get('nominate_freq_max') or NOMINATE_FREQ_SATURATED)
+    else:
+        freq_max = float(config.get('nominate_freq_saturated', NOMINATE_FREQ_SATURATED))
+    growth_max = float(config.get('nominate_freq_growth_max', NOMINATE_FREQ_GROWTH_MAX))
     min_days = int(config.get('nominate_min_days', NOMINATE_MIN_DAYS))
     apply_nom = bool(config.get('nominate_apply', False))
     nom_pct = int(config.get('max_budget_change_pct', 20) or 20)
@@ -769,6 +936,23 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         # ---------- 1) 关停护栏 ----------
         if net <= stop_net:
             if act not in STOP_ACTIONS:
+                blocked, why = _stop_precondition(row, nv, config or {})
+                if blocked:
+                    # 护栏不越权：把判断交回 AI，但强制落到「不花钱、不关停」的 observe，
+                    # 并把命中的前置条件写进 reason（人要能复核它为什么没被止损）。
+                    s['ai_action'] = act
+                    s['action'] = 'observe'
+                    s['budget_change_pct'] = 0
+                    s['guardrail'] = 'blocked_by_precondition'
+                    s['stop_precondition'] = why
+                    s['reason'] = ('【护栏·前置】净额 %+.2f 虽 ≤ 止损线 %.2f，但%s ⇒ '
+                                   '**护栏不替你做这个决定**。请按信号本身给动作'
+                                   '（换素材 / 查落地页 / 继续观察），并说明你判断的依据。原判「%s」。'
+                                   '原理由：%s'
+                                   % (net, stop_net, why, ACTION_CN.get(act, act),
+                                      s.get('reason', '')))
+                    stats['blocked_by_precondition'] += 1
+                    continue
                 _sp, _rv = nv.get('spend'), nv.get('revenue')
                 _money = ('（花费 %.2f / 回收 %.2f）' % (float(_sp), float(_rv))
                           if _sp is not None and _rv is not None else '')
@@ -795,23 +979,43 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         # ---------- 2) 加预算提名（默认只提名，不改动作）----------
         if not ENABLE_BUDGET_NOMINATION or act == 'increase_budget':
             continue
+        if act == 'pause':
+            continue      # 刚被止损的（或者 AI 自己判停的）不提名加钱
+        # 🔴 必须先确认它**在投**。2026-10-03 重放当场抓到一个：T-07 是 PAUSED 的，
+        #    AI 判的是 observe（正确），但它净额为正 + 顶格 + 频次不饱和 ⇒ 提名了。
+        #    「给一条已经停投的广告建议加预算」是荒谬的。
+        st = str(row.get('status') or '').strip().upper()
+        if st and st not in STOP_ACTIVE_STATUS:
+            continue
         fr = nv.get('fill_rate')
         fl = nv.get('freq_last')
+        ff = nv.get('freq_first')
         if fr is None or fl is None:
             continue
         fr, fl = float(fr), float(fl)
-        if not (fr >= fill_min and fl < freq_max and int(nv.get('days') or 0) >= min_days):
+        # 频次增幅：只在首末都拿到时才算，拿不到就不 disqualify（信息缺失 ≠ 不合格）
+        growth = None
+        if ff is not None and fl is not None:
+            try:
+                growth = fl - float(ff)
+            except (TypeError, ValueError):
+                growth = None
+        growth_ok = (growth is None) or (growth <= growth_max)
+        if not (fr >= fill_min and fl < freq_max and int(nv.get('days') or 0) >= min_days
+                and growth_ok):
             continue
         s['nomination'] = {
             'suggested_action': 'increase_budget',
-            'rule': 'net>%.2f 且 顶格率>=%.2f 且 末段频次<%.2f 且 天数>=%d'
-                    % (stop_net, fill_min, freq_max, min_days),
+            'rule': 'net>%.2f 且 顶格率>=%.2f 且 末段频次<%.2f（饱和线）且 频次增幅<=%.2f 且 天数>=%d'
+                    % (stop_net, fill_min, freq_max, growth_max, min_days),
             'net': round(net, 2), 'fill_rate': fr, 'freq_last': fl,
+            'freq_growth': (round(growth, 2) if growth is not None else None),
             'applied': apply_nom,
         }
         tail = ('【提名·加预算】净额 %+.2f 在赚、顶格率 %.2f（预算卡住了它）、末段频次 %.2f'
-                '（受众还没看腻）→ 建议人工复核是否加预算'
-                % (net, fr, fl))
+                '（受众还没到饱和线 %.2f%s）→ 建议人工复核是否加预算'
+                % (net, fr, fl, freq_max,
+                   '' if growth is None else '、频次增幅 %+.2f' % growth))
         if apply_nom:
             s['ai_action'] = act
             s['action'] = 'increase_budget'

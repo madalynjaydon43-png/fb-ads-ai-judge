@@ -1118,5 +1118,202 @@ class TestP1bSignals(unittest.TestCase):
                 self.assertLessEqual(r['repeat_click_days'], 2)
 
 
+class TestStopPrecondition(unittest.TestCase):
+    """护栏止损线的**前置条件**（2026-10-03 双盲实测后加）。
+
+    背景：止损线只看 `net = 购买价值 − 花费`，不看口径列、不看样本量、不看「亏在哪一环」。
+    双盲实测里它把两条本不该关的广告一刀切停（优化加购的那条 + 只点 50 次就零单的那条）。
+
+    ⚠️ 护栏**只作用于「AI 没判停但净额为负」这一个方向**；AI 自己判了 pause 的它本来就不动。
+    所以这些前置条件不会「放过该关的广告」，它只阻止「护栏替 AI 做它不该做的决定」。
+    """
+
+    BUY = 'actions:offsite_conversion.fb_pixel_purchase'
+    CART = 'actions:offsite_conversion.fb_pixel_add_to_cart'
+
+    def _row(self, **over):
+        r = {'id': 'ad1', 'name': 'X', 'status': 'ACTIVE', 'optimization_event': self.BUY,
+             'clicks': 500, 'spend': 120.0, 'purchase_value': 0.0}
+        r.update(over)
+        nv = {'net': round(float(r['purchase_value']) - float(r['spend']), 2),
+              'spend': r['spend'], 'revenue': r['purchase_value'],
+              'fill_rate': 1.0, 'freq_first': 2.0, 'freq_last': 2.4, 'days': 5}
+        # ⚠️ net_view 必须挂在 row 上：护栏是 `row.get('net_view')` 读的，
+        #    返回一个独立的字典会让它走 no_net 提前返回 —— 看着像「护栏没生效」。
+        r['net_view'] = nv
+        r['daily_spend'] = []
+        return r, nv
+
+    def _hit(self, **over):
+        r, nv = self._row(**over)
+        blocked, why = eng._stop_precondition(r, nv, {})
+        return blocked, why
+
+    # ---- 命中：四条实测误杀 ----
+    def test_blocks_when_not_active(self):
+        b, why = self._hit(status='PAUSED')
+        self.assertTrue(b)
+        self.assertIn('不在投', why)
+
+    def test_blocks_when_optimization_is_not_purchase(self):
+        b, why = self._hit(optimization_event=self.CART)
+        self.assertTrue(b)
+        self.assertIn('不是 purchase', why)
+
+    def test_blocks_when_clicks_below_sample_floor(self):
+        """实测踩过：门槛原先取 30，50 次点击没拦住 ⇒ 误杀反而涨了。"""
+        b, why = self._hit(clicks=50, spend=50.0)
+        self.assertTrue(b)
+        self.assertIn('样本不足', why)
+
+    def test_loss_size_gate_is_deliberately_disabled(self):
+        """否决记录钉成用例：**不能**让人后来又把它加回来。
+
+        「亏 50 美元就关」是噪音；但「亏 50 美元就永远不管」是更大的错 ——
+        每天只花 $5、每天亏 $3 的广告会因此永远不被止损线关掉，小预算持续失血。
+        """
+        self.assertIsNone(eng.STOP_MIN_LOSS_ABS)
+        r, nv = self._row(spend=20.0)
+        blocked, why = eng._stop_precondition(r, nv, {})
+        self.assertFalse(blocked, '小额亏损仍应照常止损：%s' % why)
+
+    def test_blocks_when_watch_time_too_short(self):
+        r, nv = self._row(spend=600.0)
+        r['video_avg_watch_sec'] = 2.1
+        blocked, why = eng._stop_precondition(r, nv, {})
+        self.assertTrue(blocked)
+        self.assertIn('素材', why)
+
+    def test_blocks_when_repeat_click_high(self):
+        r, nv = self._row(spend=500.0)
+        r['repeat_click_ratio'] = 0.45
+        blocked, why = eng._stop_precondition(r, nv, {})
+        self.assertTrue(blocked)
+        self.assertIn('反复点', why)
+
+    # ---- 不命中：该关的必须照关 ----
+    def test_does_not_block_a_genuinely_dead_ad(self):
+        """T-03 那种：ACTIVE + 优化购买 + 415 点击 + 净亏 750 + 无强信号 ⇒ 必须照关。"""
+        r, nv = self._row(spend=750.0, clicks=415)
+        blocked, why = eng._stop_precondition(r, nv, {})
+        self.assertFalse(blocked, '不该拦：%s' % why)
+
+    def test_guardrail_still_forces_pause_when_nothing_blocks(self):
+        r, nv = self._row(spend=750.0)
+        snaps = [r]
+        sugg = [{'campaign_id': 'ad1', 'action': 'observe', 'reason': 'x'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, snaps, {})
+        self.assertEqual(out[0]['action'], 'pause')
+        self.assertEqual(stats['forced_pause'], 1)
+
+    def test_guardrail_does_not_override_paused_ad(self):
+        """AI 自己判了 pause 的，护栏本来就不动；前置条件也不该把它放回来。"""
+        r, nv = self._row(spend=50.0)
+        sugg = [{'campaign_id': 'ad1', 'action': 'pause', 'reason': 'x'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [r], {})
+        self.assertEqual(out[0]['action'], 'pause')
+        self.assertEqual(stats['forced_pause'], 0)
+        self.assertEqual(stats['blocked_by_precondition'], 0)
+
+    def test_precondition_downgrades_to_observe_with_reason(self):
+        r, nv = self._row(optimization_event=self.CART, spend=600.0)
+        sugg = [{'campaign_id': 'ad1', 'action': 'increase_budget', 'reason': 'x'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [r], {})
+        self.assertEqual(out[0]['action'], 'observe')
+        self.assertEqual(out[0]['guardrail'], 'blocked_by_precondition')
+        self.assertEqual(stats['forced_pause'], 0)
+        self.assertEqual(stats['blocked_by_precondition'], 1)
+        self.assertIn('护栏不替你做这个决定', out[0]['reason'])
+
+
+class TestNomination(unittest.TestCase):
+    """加预算提名：饱和线替代拟合值 + 停投对象不提名。"""
+
+    BUY = 'actions:offsite_conversion.fb_pixel_purchase'
+
+    def _snap(self, **over):
+        r = {'id': 'ad1', 'name': 'X', 'status': 'ACTIVE', 'optimization_event': self.BUY,
+             'clicks': 2200, 'net_view': {
+                 'net': 2225.0, 'spend': 750.0, 'revenue': 2975.0,
+                 'fill_rate': 1.0, 'freq_first': 1.9, 'freq_last': 2.4, 'days': 5}}
+        r.update(over)
+        return r
+
+    def test_freq_2_4_now_nominates(self):
+        """实测：freq 2.4（远未饱和、加预算后 ROAS 反升）在旧的 1.35 门槛下提名数为 0。"""
+        self.assertEqual(eng.NOMINATE_FREQ_SATURATED, 3.5)
+        sugg = [{'campaign_id': 'ad1', 'action': 'observe', 'reason': 'x'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [self._snap()], {})
+        self.assertEqual(stats['nominated'], 1)
+        self.assertEqual(out[0]['nomination']['freq_last'], 2.4)
+
+    def test_near_saturated_freq_does_not_nominate(self):
+        sugg = [{'campaign_id': 'ad1', 'action': 'observe', 'reason': 'x'}]
+        snap = self._snap()
+        snap['net_view']['freq_last'] = 4.2
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(stats['nominated'], 0)
+
+    def test_rapidly_rising_freq_does_not_nominate(self):
+        """频次不高但在快速堆高（末−首 = 1.2）⇒ 放量空间正在关闭，不该提名。"""
+        sugg = [{'campaign_id': 'ad1', 'action': 'observe', 'reason': 'x'}]
+        snap = self._snap()
+        snap['net_view']['freq_first'] = 1.2
+        snap['net_view']['freq_last'] = 2.4      # 绝对值不饱和，但增幅 1.2 > 0.5
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(stats['nominated'], 0)
+
+    def test_paused_ad_is_never_nominated(self):
+        """重放当场抓到的 bug：PAUSED 的广告被判 observe，净额为正 + 顶格 + 频次不饱和
+        ⇒ 提名了。「给一条已经停投的广告建议加预算」是荒谬的。"""
+        sugg = [{'campaign_id': 'ad1', 'action': 'observe', 'reason': 'x'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [self._snap(status='PAUSED')], {})
+        self.assertEqual(stats['nominated'], 0)
+        self.assertNotIn('nomination', out[0])
+
+    def test_legacy_config_still_wins(self):
+        """老配置里写了 nominate_freq_max 就以它为准（别让升级悄悄改掉别人的阈值）。"""
+        sugg = [{'campaign_id': 'ad1', 'action': 'observe', 'reason': 'x'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [self._snap()],
+                                                {'nominate_freq_max': 1.35})
+        self.assertEqual(stats['nominated'], 0, '旧阈值 1.35 下 freq 2.4 不该提名')
+
+
+class TestLossAttributionPrompt(unittest.TestCase):
+    """prompt 里那两条新东西：亏损归因规则 + 按快照动态点名强信号。"""
+
+    def _snap(self, name='X', **over):
+        r = {'id': 'ad1', 'name': name, 'status': 'ACTIVE',
+             'spend': 100.0, 'clicks': 100, 'purchase': 0, 'daily_spend': []}
+        r.update(over)
+        return r
+
+    def test_prompt_has_loss_attribution_rule(self):
+        p = eng.build_prompt([self._snap()], {}, window=('2026-04-01', '2026-04-05'))
+        self.assertIn('判「亏在哪」', p)
+        self.assertIn('买不到有效流量', p)
+        self.assertIn('流量买到了但接不住', p)
+
+    def test_flag_section_names_the_high_repeat_click_ad(self):
+        """信号埋在字段说明里没用（双盲两轮都没读它）⇒ 命中阈值必须按名字单独点名。"""
+        snaps = [self._snap('甲', repeat_click_ratio=0.45),
+                 self._snap('乙', repeat_click_ratio=0.02)]
+        p = eng.build_prompt(snaps, {}, window=('2026-04-01', '2026-04-05'))
+        seg = eng._flag_section(snaps)
+        self.assertIn('甲', seg)
+        self.assertNotIn('乙', seg)
+        self.assertIn('强信号', p)
+
+    def test_flag_section_names_short_watch_time_ad(self):
+        snaps = [self._snap('丙', video_avg_watch_sec=2.0)]
+        seg = eng._flag_section(snaps)
+        self.assertIn('丙', seg)
+        self.assertIn('素材', seg)
+
+    def test_flag_section_empty_when_no_signal(self):
+        snaps = [self._snap('丁')]
+        self.assertEqual(eng._flag_section(snaps), '')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
