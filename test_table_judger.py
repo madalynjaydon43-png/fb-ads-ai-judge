@@ -423,6 +423,104 @@ class TestBacktest(unittest.TestCase):
         self.assertGreaterEqual(res['stop_recall'], 0.0)
 
 
+P_SIM = os.path.join(D, '模拟广告数据-100广告10天-v5.csv')
+
+# 用户 Ads Manager「导出」的原始表头（2026-10-02 实测，24 列）。
+REAL_EXPORT_HEADER = [
+    '报告开始日期', '报告结束日期', '广告系列名称', '广告系列投放', '归因设置',
+    '成效', '成效指标', '覆盖人数', '展示次数', '频次', '链接点击量',
+    '单次链接点击费用 (USD)', 'CPM（千次展示费用） (USD)', '广告组预算', '广告组预算类型',
+    '已花费金额 (USD)', '加入购物车次数', '结账发起次数', '购物次数', '添加支付信息',
+    '购物转化价值', '广告花费回报 (ROAS) - 购物', '结果（初始）', '成效（初始）指标',
+]
+
+
+def _write_csv(header, rows=None):
+    """写一个只有表头（和一行 0）的临时 CSV，返回路径。"""
+    fd, p = tempfile.mkstemp(suffix='.csv')
+    os.close(fd)
+    with io.open(p, 'w', encoding='utf-8-sig', newline='') as f:
+        f.write(','.join('"%s"' % h for h in header) + '\n')
+        if rows:
+            for r in rows:
+                f.write(','.join(str(x) for x in r) + '\n')
+        else:
+            f.write(','.join('0' for _ in header) + '\n')
+    return p
+
+
+class TestColumns(unittest.TestCase):
+    """列名映射与缺列行为 —— 保护「数据能不能喂进来」这条命脉。
+
+    背景（2026-10-02）：原来只认 Ads Manager 的一种长列名，且缺列会静默变成 0，
+    于是「这项没读到」被当成「这项是 0」，判断结果悄悄失真而没有任何提示。
+    """
+
+    def test_real_export_header_resolves_all(self):
+        """真实 Ads Manager 导出的 24 列表头，15 个必需列必须全部认出来。"""
+        miss, cm, _ = tj.missing_columns(REAL_EXPORT_HEADER)
+        self.assertEqual(miss, [])
+        for k in tj.BLOCKING_KEYS:
+            with self.subTest(key=k):
+                self.assertIsNotNone(cm.get(k), '没认出 %s' % k)
+
+    def test_simulated_data_columns_complete(self):
+        """仓库自带模拟数据（按模范表生成）必须 15/15 —— 这是数据与代码的合同。"""
+        rows = tj.read_csv_rows(P_SIM)
+        miss, cm, _ = tj.missing_columns(list(rows[0].keys()))
+        self.assertEqual(miss, [], '模拟数据缺列了：%s' % miss)
+        for k in tj.REQUIRED_KEYS:
+            with self.subTest(key=k):
+                self.assertEqual(cm.get(k), tj.CSV_FIELDS[k])
+
+    def test_short_names_resolve(self):
+        """仓库 pull_real3.py 拍平的短名也要认。"""
+        pairs = {'日期': 'date', '覆盖': 'reach', '展示': 'impressions', '链接点击': 'clicks',
+                 '花费': 'spend', '加购': 'add_to_cart', '结账': 'initiate_checkout',
+                 '购买': 'purchase', '支付信息': 'add_payment_info', '购买价值': 'purchase_value'}
+        cm = tj.resolve_columns(list(pairs.keys()))
+        for col, key in pairs.items():
+            with self.subTest(col=col):
+                self.assertEqual(cm.get(key), col)
+
+    def test_purchase_not_swallowed_by_purchase_value(self):
+        """别名必须精确命中：「购买」不能被「购买价值」吃掉（次数 ≠ 金额）。"""
+        cm = tj.resolve_columns(['报告开始日期', '购买', '购买价值'])
+        self.assertEqual(cm['purchase'], '购买')
+        self.assertEqual(cm['purchase_value'], '购买价值')
+
+    def test_cpc_column_is_optional(self):
+        """cpc 列缺了不算缺 —— 30 维里的 CPC 是现算的，不用导出那一列。"""
+        header = [c for c in REAL_EXPORT_HEADER if c != '单次链接点击费用 (USD)']
+        miss, _, _ = tj.missing_columns(header)
+        self.assertEqual(miss, [])
+        self.assertIn('cpc', tj.OPTIONAL_KEYS)
+
+    def test_missing_blocking_column_raises(self):
+        """缺了会让特征失真的列：strict 时必须抛错，不许静默变 0。"""
+        header = [c for c in REAL_EXPORT_HEADER if c != '购物次数']
+        tmp = _write_csv(header)
+        with self.assertRaises(tj.ColumnError):
+            tj.load_csv_grouped(tmp, strict=True)
+        groups = tj.load_csv_grouped(tmp, strict=False, quiet=True)
+        self.assertTrue(groups, '放行时也要能读出分组')
+
+    def test_column_used_for_covers_every_key(self):
+        """COLUMN_USED_FOR 必须覆盖每个必需列 —— 防以后加列忘了写人话说明。"""
+        for k in tj.REQUIRED_KEYS:
+            with self.subTest(key=k):
+                self.assertIn(k, tj.COLUMN_USED_FOR)
+
+    def test_days_from_csv_rows_accepts_colmap(self):
+        """days_from_csv_rows 支持外部传入 colmap，且与自动解析结果一致。"""
+        rows = tj.read_csv_rows(P_SIM)
+        cm = tj.resolve_columns(list(rows[0].keys()))
+        a = tj.days_from_csv_rows(rows[:5], cm)
+        b = tj.days_from_csv_rows(rows[:5])
+        self.assertEqual([d['spend'] for d in a], [d['spend'] for d in b])
+        self.assertEqual([d['date'] for d in a], [d['date'] for d in b])
+
+
 class TestStoreUntouchedByRepo(unittest.TestCase):
     def test_store_path_is_repo_relative(self):
         """learning_store.jsonl 必须是运行时产物（落在仓库根、可被 .gitignore 排除）。"""

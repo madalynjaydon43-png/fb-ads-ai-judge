@@ -103,6 +103,7 @@ python gen_v5.py                     # 重新造一份数据（固定随机种�
 
 python test_table_judger.py          # 学习层测试 → 21/21
 python learn_cycle.py status         # 飞轮进度（快照/已标注/距上岗）
+python learn_cycle.py check --csv "你的导出.csv"   # 列自检：这份导出能不能喂进来
 python learn_cycle.py backtest --from-sim   # 判卷：5 折折外 + 规则基线并排，不落盘
 ```
 
@@ -151,7 +152,7 @@ python _v12_history.py                     # 把每轮结果按时间和数据�
 |---|---|
 | [`table_judger.py`](table_judger.py) | 能从历史结局学习的判断层（随机森林 + 规则回退 + 加预算只提名） |
 | [`flywheel.py`](flywheel.py) | 快照/标签存储（`learning_store.jsonl`）与两种回填（模拟 / 真实） |
-| [`learn_cycle.py`](learn_cycle.py) | CLI 扳手：`status` / `backfill` / `backtest` |
+| [`learn_cycle.py`](learn_cycle.py) | CLI 扳手：`status` / `check` / `backfill` / `backtest` |
 | [`test_table_judger.py`](test_table_judger.py) | 学习层测试 21 项：特征口径、标签、护栏覆盖、弃权、判卷、去重 |
 
 > ⚠️ `feed_v11_twophase.py` / `_v12_compare.py` / `_v12_history.py` 这三只要读
@@ -277,6 +278,50 @@ sched = AdsAiScheduler(get_insights_fn, judger=judger)
 
 合并后的结果**仍要过一次 `enforce_risk_guardrails`** —— 护栏压在 LLM 与模型两路之上，
 顺序是「覆盖率兜底 → 模型合并 → 护栏」，错一步就会被覆盖回去。
+
+### 需要哪些列（喂 CSV 之前先跑自检）
+
+**30 维特征不是 30 个列，而是从 15 个指标列算出来的**（比率、斜率、时间分布都在代码里现算）。
+所以能不能喂进来，取决于这 15 个列名认不认得出来。先跑这一条：
+
+```bash
+python learn_cycle.py check --csv "你的导出.csv"
+```
+
+它会逐列告诉你「认到没认到」以及「这一列用来算哪些特征」，缺列直接给结论。
+实测（Ads Manager 导出 `voglyn-1`，24 列表头）：**15 / 15 全部认出来，列齐全，可以直接喂。**
+
+| 内部字段 | Ads Manager 导出的列名 | 还接受的别名 | 用来算哪些特征 |
+|---|---|---|---|
+| `date` | 报告开始日期 | 日期 / date / day | 排序、切窗口、「前3天购买占比」「首单在第几天」 |
+| `reach` | 覆盖人数 | 触达人数 / 覆盖 / reach | 覆盖首/末/斜率% |
+| `impressions` | 展示次数 | 展示量 / 展示 / impressions | CTR首/末/斜率%、曝光斜率%、CPM 换算 |
+| `frequency` | 频次 | frequency | 频次首/末、频次增幅 |
+| `clicks` | 链接点击量 | 链接点击 / inline_link_clicks / clicks | CTR%、CPC、加购率、购买率 |
+| `cpm` | CPM（千次展示费用） (USD) | CPM / cpm | CPM首/末/斜率% |
+| `budget` | 广告组预算 | 广告系列预算 / 预算 | **花费率（= 花费÷(预算×天数)，即「顶格率」）** |
+| `btype` | 广告组预算类型 | 预算类型 | 是系列预算（CBO / ABO） |
+| `spend` | 已花费金额 (USD) | 花费金额 / 花费 / spend | 花费、ROAS、CPC、单均成本、花费率 |
+| `add_to_cart` | 加入购物车次数 | 加购次数 / 加购 | 加购率 |
+| `initiate_checkout` | 结账发起次数 | 发起结账次数 / 结账 | 结账率 |
+| `add_payment_info` | 添加支付信息 | 添加支付信息次数 / 支付信息 | 支付率 |
+| `purchase` | 购物次数 | 购买次数 / 购买 | 购买、日均购买、单均成本、客单价、前3天购买占比、首单在第几天 |
+| `purchase_value` | 购物转化价值 | 购买转化价值 / 购买价值 | 收入、ROAS、客单价 |
+| `cpc` | 单次链接点击费用 (USD) | CPC / cpc | **（不影响任何特征 —— 导不导出都行）** |
+
+三条判定规则：
+
+1. **列名按「归一化后精确相等」匹配**，不是子串 —— 否则「购买」会吃掉「购买价值」
+   （次数 ≠ 金额，两个不同指标）。
+2. **缺列会直接报错，不会静默当成 0。** 这是刻意的：`已花费金额` 没读到和「今天没花钱」
+   在数据里长得一模一样，静默兜底等于拿假数据训练。
+   `learn_cycle.py check` / `load_csv_grouped(strict=True)` 缺列抛 `ColumnError`；
+   `read_grouped_rows(strict=False)` 只告警放行（供调试）。
+3. **`cpc` 是唯一可选列**，缺了不算缺 —— 30 维里的「CPC」是 `花费 ÷ 链接点击` 现算的
+   （实测抽掉这一列，30 维里 0 个变化）。
+
+> 列名是全角/半角空格与 BOM 都容忍的（`报告开始日期 ` 和 `报告开始日期` 等价），
+> 也吃英文键（`spend` / `reach` / `impressions` …），方便从 Graph API 直接拼 CSV。
 
 ---
 

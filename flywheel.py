@@ -45,6 +45,7 @@ from table_judger import (
     derive_label,
     extract_features,
     fnum,
+    read_grouped_rows,
     _features_from_days,
 )
 
@@ -194,15 +195,18 @@ def build_records_from_truth(data_csv=None, truth_csv=None, hid_csv=None):
         for r in csv.DictReader(f):
             hid.setdefault(r['广告'], {}).setdefault(r['方案'], []).append(r)
 
-    g = {}
-    with io.open(data_csv, encoding='utf-8-sig') as f:
-        for r in csv.DictReader(f):
-            g.setdefault(r.get('广告系列名称', ''), []).append(r)
-
+    # 列名走别名解析（不再只认 Ads Manager 长列名）；缺列不静默 ——
+    # 拿不到必需列会在这里告警/报错，而不是把 0 当成真值。
+    # 别名表见 table_judger.COL_ALIASES。
+    g, meta = read_grouped_rows(data_csv, strict=False, quiet=True)
+    dc = meta['date_col']
+    bcol = meta['colmap'].get('budget')
+    _ = bcol
+    icol = meta['id_col']
     recs = []
     for name, rows in g.items():
-        rows.sort(key=lambda z: z.get('报告开始日期', ''))
-        feat = _features_from_days(days_from_csv_rows(rows))
+        rows.sort(key=lambda z: str(z.get(dc, '') if dc else ''))
+        feat = _features_from_days(days_from_csv_rows(rows, meta['colmap']))
         if feat is None:
             continue
         nb = (hid.get(name) or {}).get('不动') or []
@@ -219,7 +223,7 @@ def build_records_from_truth(data_csv=None, truth_csv=None, hid_csv=None):
         fill = (spend / (budget * len(nb))) if budget else 0.0
         t = truth.get(name, {})
         outcome = {
-            'window': _next_days(rows[-1].get('报告开始日期', ''), len(nb)),
+            'window': _next_days(rows[-1].get(dc, '') if dc else '', len(nb)),
             'spend': round(spend, 2),
             'purchase_value': round(rev, 2),
             'fill_rate': round(fill, 3),
@@ -231,7 +235,7 @@ def build_records_from_truth(data_csv=None, truth_csv=None, hid_csv=None):
             'counterfactual': True,
         }
         outcome['label'] = derive_label(outcome)
-        ad_id = str(rows[0].get('广告系列 ID') or name)
+        ad_id = str((rows[0].get(icol) if icol else None) or name)
         recs.append({
             'ts': 'backfill',
             'ad_id': ad_id,
@@ -281,28 +285,36 @@ def build_records_from_window(csv_path, head_days=5, split_date=None):
       它能学「什么样的前半段后来亏了/赚了」，学不到「加预算能不能救回来」。
 
     split_date: 判断时点。给了就按日期切；不给就按每条广告的前 head_days 天切。
+
+    列名走别名解析（`table_judger.COL_ALIASES`），所以 Ads Manager 长列名、
+    本仓库 pull_real3.py 拍平的短名都能吃。缺必需列会直接抛 `ColumnError` ——
+    宁可跑不动，也不往 store 里写「缺列被当成 0」的假标签。
     """
-    g = {}
-    with io.open(csv_path, encoding='utf-8-sig') as f:
-        for r in csv.DictReader(f):
-            g.setdefault(r.get('广告系列名称', ''), []).append(r)
+    g, meta = read_grouped_rows(csv_path, strict=True)
+    dc = meta['date_col']
+    bcol = meta['colmap'].get('budget')
+    icol = meta['id_col']
+
+    def _d(r):
+        return str(r.get(dc, '') if dc else '')
 
     recs = []
     for name, rows in g.items():
-        rows.sort(key=lambda z: z.get('报告开始日期', ''))
+        rows.sort(key=lambda z: _d(z))
         if split_date:
-            head_rows = [r for r in rows if r.get('报告开始日期', '') <= split_date]
-            tail_rows = [r for r in rows if r.get('报告开始日期', '') > split_date]
+            head_rows = [r for r in rows if _d(r) <= split_date]
+            tail_rows = [r for r in rows if _d(r) > split_date]
         else:
             head_rows, tail_rows = rows[:head_days], rows[head_days:]
         if len(head_rows) < 2 or not tail_rows:
             continue
-        feat = _features_from_days(days_from_csv_rows(head_rows))
+        feat = _features_from_days(days_from_csv_rows(head_rows, meta['colmap']))
         if feat is None:
             continue
-        nv = _window_net_view(days_from_csv_rows(tail_rows), rows[0].get('广告组预算'))
+        nv = _window_net_view(days_from_csv_rows(tail_rows, meta['colmap']),
+                              rows[0].get(bcol) if bcol else None)
         outcome = {
-            'window': [tail_rows[0].get('报告开始日期'), tail_rows[-1].get('报告开始日期')],
+            'window': [_d(tail_rows[0]), _d(tail_rows[-1])],
             'spend': round(nv['spend'], 2),
             'purchase_value': round(nv['revenue'], 2),
             'fill_rate': round(nv['fill_rate'], 3),
@@ -315,12 +327,12 @@ def build_records_from_window(csv_path, head_days=5, split_date=None):
             'head_days': len(head_rows),
         }
         outcome['label'] = derive_label(outcome)
-        ad_id = str(rows[0].get('广告系列 ID') or name)
+        ad_id = str((rows[0].get(icol) if icol else None) or name)
         recs.append({
             'ts': 'backfill',
             'ad_id': ad_id,
             'ad_name': name,
-            'key': '%s|%s' % (ad_id, tail_rows[-1].get('报告开始日期')),
+            'key': '%s|%s' % (ad_id, _d(tail_rows[-1])),
             'features': feat,
             'tool_action': None,
             'outcome': outcome,

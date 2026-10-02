@@ -2,6 +2,7 @@
 """learn_cycle.py —— 飞轮的 CLI 扳手。
 
     python learn_cycle.py status                       # 现在攒到哪一步了
+    python learn_cycle.py check --csv X                # 这份导出能不能喂进来（列自检）
     python learn_cycle.py backfill --mode sim          # 模拟数据回填（反事实真值表）
     python learn_cycle.py backfill --mode real --csv X # 真实导出回填（无反事实）
     python learn_cycle.py backtest                     # 判卷：模型 vs 规则回退
@@ -187,6 +188,57 @@ def cmd_backtest(args):
     return 0
 
 
+# ==================== check（列自检）====================
+
+def cmd_check(args):
+    """自检一份导出能不能喂进来：认出哪些列、缺哪些列、缺了哪几维会失真。"""
+    path = args.csv or P_DATA
+    print('=' * 78)
+    print('列自检 · %s' % path)
+    print('=' * 78)
+    if not os.path.exists(path):
+        print('文件不存在。', file=sys.stderr)
+        return 2
+    rows = tj_mod.read_csv_rows(path)
+    if not rows:
+        print('文件是空的。', file=sys.stderr)
+        return 2
+
+    header = list(rows[0].keys())
+    miss, cm, unknown = tj_mod.missing_columns(header)
+    ok = [k for k in tj_mod.BLOCKING_KEYS if cm.get(k)]
+    print('表头 %d 列 · 数据 %d 行' % (len(header), len(rows)))
+    print('必须的指标列：认出 %d / %d' % (len(ok), len(tj_mod.BLOCKING_KEYS)))
+    try:
+        g, meta = tj_mod.read_grouped_rows(path, strict=True)
+        print('分组列：%s   日期列：%s   %d 组'
+              % (meta['group_col'], meta['date_col'], len(g)))
+    except tj_mod.ColumnError as e:
+        print('分组失败：%s' % e, file=sys.stderr)
+    print()
+    print('  %-20s %-28s %s' % ('内部字段', '认到的列名', '用来算哪些特征'))
+    print('  ' + '-' * 74)
+    for k in tj_mod.REQUIRED_KEYS:
+        col = cm.get(k) or '【缺】'
+        mark = '' if cm.get(k) else ('  ← 可选' if k in tj_mod.OPTIONAL_KEYS else '  ← 缺列')
+        print('  %-20s %-28s %s%s' % (k, col, tj_mod.COLUMN_USED_FOR.get(k, ''), mark))
+    if unknown:
+        print()
+        print('  没被用上的列（正常，导出通常带一堆不需要的）：%s' % '、'.join(unknown[:12]))
+    print()
+    if not miss:
+        print('结论：列齐全，可以直接喂。')
+        return 0
+    print('结论：缺 %d 个必需列 —— %s' % (len(miss), '、'.join(tj_mod.COL_ALIASES[k][0] for k in miss)))
+    print('      它们会被当成 0（= 「这项没读到」被当成「这项是 0」），判断结果不可信。')
+    print('      会失真的特征：')
+    for k in miss:
+        print('        · %s  →  %s' % (tj_mod.COL_ALIASES[k][0], tj_mod.COLUMN_USED_FOR.get(k, '')))
+    print()
+    print('怎么补：Ads Manager → 报告 → 自定义列，勾上上面这些指标，再重新导出 CSV。')
+    return 1
+
+
 # ==================== main ====================
 
 def build_parser():
@@ -213,6 +265,10 @@ def build_parser():
     b.add_argument('--split', default=None, help='真实模式：判断时点 YYYY-MM-DD')
     b.add_argument('--head-days', type=int, default=5, help='可见窗口天数（默认 5）')
     b.set_defaults(func=cmd_backfill)
+
+    c = sub.add_parser('check', help='列自检：这份导出能不能喂进来')
+    c.add_argument('--csv', default=None, help='要检查的 CSV（默认检查仓库自带模拟数据）')
+    c.set_defaults(func=cmd_check)
 
     t = sub.add_parser('backtest', help='判卷')
     t.add_argument('--store', default=P_STORE)

@@ -29,27 +29,29 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 
 # ---------- 列名映射（尽量吃下 Ads Manager 各种导出变体） ----------
+# 每组都按「越具体越靠前」排；匹配是归一化后**精确相等**（见 _Row.pick），不是子串。
+# 末尾那批单字/双字名，是本仓库 pull_real3.py 拍平的短名格式（真实导出用的那一套）。
 COL_DATE = ['报告开始日期', '日期', 'date', 'day']
 COL_AD = ['广告名称', '广告名', 'ad_name', 'ad name']
 COL_AD_ID = ['广告 ID', '广告id', 'ad_id', 'ad id']
-COL_CAMP = ['广告系列名称', '系列名称', 'campaign_name']
+COL_CAMP = ['广告系列名称', '系列名称', 'campaign_name', '系列']
 COL_STATUS = ['广告状态', '广告投放', '广告系列投放', '投放状态', 'status']
 COL_OBJ = ['广告系列目标', '广告目标', 'objective']
 COL_METRIC = ['成效指标', 'results_indicator', '成效']
-COL_SPEND = ['已花费金额 (USD)', '已花费金额', '花费金额', '金额 (USD)', 'spend']
-COL_IMP = ['展示次数', '展示量', 'impressions']
-COL_REACH = ['覆盖人数', '触达人数', 'reach']
-COL_CLICK = ['链接点击量', '链接点击次数', 'inline_link_clicks', 'clicks']
-COL_CPC = ['单次链接点击费用 (USD)', '单次链接点击费用', 'cpc']
-COL_CPM = ['CPM（千次展示费用） (USD)', 'CPM (USD)', 'CPM（千次展示费用）', 'cpm']
-COL_CART = ['加入购物车次数', '加购次数', 'add_to_cart']
-COL_CHECKOUT = ['结账发起次数', '发起结账次数', 'initiate_checkout']
-COL_PURCH = ['购物次数', '购买次数', 'purchase']
-COL_PAY = ['添加支付信息', '添加支付信息次数', 'add_payment_info']
-COL_PVAL = ['购物转化价值', '购买转化价值', 'purchase_value']
+COL_SPEND = ['已花费金额 (USD)', '已花费金额', '花费金额', '金额 (USD)', 'spend', '花费']
+COL_IMP = ['展示次数', '展示量', 'impressions', '展示']
+COL_REACH = ['覆盖人数', '触达人数', 'reach', '覆盖']
+COL_CLICK = ['链接点击量', '链接点击次数', 'inline_link_clicks', 'clicks', '链接点击']
+COL_CPC = ['单次链接点击费用 (USD)', '单次链接点击费用', 'cpc', 'CPC']
+COL_CPM = ['CPM（千次展示费用） (USD)', 'CPM (USD)', 'CPM（千次展示费用）', 'cpm', 'CPM']
+COL_CART = ['加入购物车次数', '加购次数', 'add_to_cart', '加购']
+COL_CHECKOUT = ['结账发起次数', '发起结账次数', 'initiate_checkout', '结账']
+COL_PURCH = ['购物次数', '购买次数', 'purchase', '购买']
+COL_PAY = ['添加支付信息', '添加支付信息次数', 'add_payment_info', '支付信息']
+COL_PVAL = ['购物转化价值', '购买转化价值', 'purchase_value', '购买价值']
 COL_VIEW = ['内容查看次数', '落地页浏览量', '内容查看', 'view_content', 'landing_page_view']
 COL_ADSET_BUDGET = ['广告组预算', 'adset_budget']
-COL_ADSET_BUDGET_TYPE = ['广告组预算类型', 'adset_budget_type']
+COL_ADSET_BUDGET_TYPE = ['广告组预算类型', '广告系列预算类型', 'adset_budget_type', '预算类型']
 COL_CAMP_BUDGET = ['广告系列预算', '系列预算', 'campaign_budget']
 
 

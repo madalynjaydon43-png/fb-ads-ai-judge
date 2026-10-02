@@ -57,6 +57,7 @@ import csv
 import io
 import json
 import os
+import sys
 
 D = os.path.dirname(os.path.abspath(__file__))
 P_STORE = os.path.join(D, 'learning_store.jsonl')
@@ -73,6 +74,7 @@ MIN_BACKTEST_LABELS = 50   # 少于这么多条拒绝判卷（会直接报错）
 ACTION_CN = {'pause': '暂停', 'increase_budget': '加预算', 'observe': '观察'}
 
 # ---------- 中文列 → 内部英文键（与 _solvability_v5.py 读同一批列）----------
+# 这一份是「规范名」：Ads Manager「导出」的默认列名，也是 _solvability_v5.py 认的名字。
 CSV_FIELDS = {
     'date': '报告开始日期',
     'reach': '覆盖人数',
@@ -89,6 +91,59 @@ CSV_FIELDS = {
     'purchase': '购物次数',
     'add_payment_info': '添加支付信息',
     'purchase_value': '购物转化价值',
+}
+
+# ---------- 列名别名表（内部键 → 可接受的列名，按优先级）----------
+# 第 1 个 = 上面的规范名；后面是同一个指标在别处的常见写法：
+#   · Ads Manager 其它导出（精简列 / 其它语言包）
+#   · 本仓库 pull_real3.py 拍平的短名 —— **真实导出用的就是这一套**
+# ⚠️ 匹配是「归一化之后精确相等」，不是子串。否则「购买」会吃掉「购买价值」，
+#    而这两个是不同指标（次数 vs 金额）。
+COL_ALIASES = {
+    'date': ['报告开始日期', '日期', 'date', 'day'],
+    'reach': ['覆盖人数', '触达人数', '覆盖', 'reach'],
+    'impressions': ['展示次数', '展示量', '展示', 'impressions'],
+    'frequency': ['频次', 'frequency'],
+    'clicks': ['链接点击量', '链接点击次数', '链接点击', 'inline_link_clicks', 'clicks'],
+    'cpc': ['单次链接点击费用 (USD)', '单次链接点击费用', 'CPC', 'cpc'],
+    'cpm': ['CPM（千次展示费用） (USD)', 'CPM (USD)', 'CPM（千次展示费用）', 'CPM', 'cpm'],
+    'budget': ['广告组预算', '广告系列预算', '系列预算', '预算', 'adset_budget', 'campaign_budget'],
+    'btype': ['广告组预算类型', '广告系列预算类型', '预算类型', 'adset_budget_type'],
+    'spend': ['已花费金额 (USD)', '已花费金额', '花费金额', '金额 (USD)', '花费', 'spend'],
+    'add_to_cart': ['加入购物车次数', '加购次数', '加购', 'add_to_cart'],
+    'initiate_checkout': ['结账发起次数', '发起结账次数', '结账', 'initiate_checkout'],
+    'purchase': ['购物次数', '购买次数', '购买', 'purchase'],
+    'add_payment_info': ['添加支付信息', '添加支付信息次数', '支付信息', 'add_payment_info'],
+    'purchase_value': ['购物转化价值', '购买转化价值', '购买价值', 'purchase_value'],
+}
+
+# 全部 15 列（与离线 _solvability_v5.py 的口径一致）。
+REQUIRED_KEYS = tuple(COL_ALIASES.keys())
+
+# 其中真正会让判断失真的 14 列。
+# `cpc` 例外：30 维里的「CPC」是 花费÷链接点击 现算的，**根本没用导出那一列**
+# （实测抽掉它 0 个特征变化）。所以它缺了不算错，只是白导出。
+OPTIONAL_KEYS = ('cpc',)
+BLOCKING_KEYS = tuple(k for k in REQUIRED_KEYS if k not in OPTIONAL_KEYS)
+
+# 每个必需列「被用来算什么」——只用于 `learn_cycle check` 的人话提示，不参与计算。
+# 覆盖面由测试保证：REQUIRED_KEYS 里的每个键都必须在这里有说明。
+COLUMN_USED_FOR = {
+    'date': '排序 / 切窗口 / 「前3天购买占比」「首单在第几天」',
+    'reach': '覆盖首、覆盖末、覆盖斜率%',
+    'impressions': 'CTR首/末/斜率%、曝光斜率%、CPM 换算',
+    'frequency': '频次首、频次末、频次增幅',
+    'clicks': 'CTR%、CPC、加购率、购买率',
+    'cpc': '（不影响任何特征 —— 保留只为对齐离线口径）',
+    'cpm': 'CPM首、CPM末、CPM斜率%',
+    'budget': '花费率（= 花费÷(预算×天数)，即「顶格率」）、预算',
+    'btype': '是系列预算（CBO / ABO）',
+    'spend': '花费、ROAS、CPC、单均成本、花费率',
+    'add_to_cart': '加购率',
+    'initiate_checkout': '结账率',
+    'purchase': '购买、日均购买、单均成本、客单价、前3天购买占比、首单在第几天',
+    'add_payment_info': '支付率',
+    'purchase_value': '收入、ROAS、客单价',
 }
 
 FEATURE_KEYS = [
@@ -112,20 +167,101 @@ def fnum(x):
         return 0.0
 
 
+# ==================== 0. 列名自检（缺列必须大声，不能静默变 0）====================
+
+class ColumnError(ValueError):
+    """必需的指标列缺失。缺列会被当成 0，判断结果不可信，所以宁可报错。"""
+
+
+def norm_col(s):
+    """列名归一：去 BOM / 半角空格 / 全角空格，转小写。"""
+    return (str(s if s is not None else '')
+            .replace('\ufeff', '')
+            .replace(' ', '')
+            .replace('\u3000', '')
+            .strip()
+            .lower())
+
+
+def resolve_columns(header):
+    """列名列表 → {内部键: 命中的列名 或 None}。按别名优先级取第一个命中的。
+
+    ⚠️ 精确相等（归一化后），不是子串匹配 —— 否则「购买」会吃掉「购买价值」。
+    """
+    idx = {}
+    for h in header:
+        idx.setdefault(norm_col(h), h)
+    out = {}
+    for key, names in COL_ALIASES.items():
+        hit = None
+        for n in names:
+            if norm_col(n) in idx:
+                hit = idx[norm_col(n)]
+                break
+        out[key] = hit
+    return out
+
+
+def missing_columns(header):
+    """返回 (缺失的**阻塞性**内部键列表, {内部键: 命中列名}, 没被用上的列名列表)。
+
+    只把 `BLOCKING_KEYS` 的缺失当问题；`cpc` 缺了不算（它压根不参与特征）。
+    """
+    cm = resolve_columns(header)
+    miss = [k for k in BLOCKING_KEYS if not cm.get(k)]
+    used = set(v for v in cm.values() if v)
+    unknown = [h for h in header if h not in used]
+    return miss, cm, unknown
+
+
+def _missing_msg(miss, path=None):
+    names = '、'.join('%s（或 %s）' % (COL_ALIASES[k][0], COL_ALIASES[k][1]) for k in miss)
+    return ('缺少 %d 个必需指标列：%s\n'
+            '  ⇒ 这些字段会被当成 0。注意：这是「这项没读到」，不是「这项是 0」。\n'
+            '  ⇒ 判断结果不可信。补列方式见 README「需要哪些列」。%s'
+            % (len(miss), names, ('\n  ⇒ 文件：%s' % path) if path else ''))
+
+
+def read_csv_rows(path):
+    """读一份 Ads Manager 导出（吃 UTF-8 BOM），返回 list[dict]。"""
+    with io.open(path, encoding='utf-8-sig') as f:
+        return list(csv.DictReader(f))
+
+
+def check_csv_columns(path, strict=True):
+    """自检一份导出能不能喂给本模块。返回 (miss, cm, unknown)；strict 时缺列直接抛。"""
+    rows = read_csv_rows(path)
+    if not rows:
+        return [], {}, []
+    miss, cm, unknown = missing_columns(list(rows[0].keys()))
+    if miss and strict:
+        raise ColumnError(_missing_msg(miss, path))
+    return miss, cm, unknown
+
+
 # ==================== 1. 两个适配器 → 内部逐日结构 ====================
 
-def days_from_csv_rows(rows):
+def days_from_csv_rows(rows, colmap=None):
     """中文列逐日行 → 内部逐日结构（按日期排序）。
 
+    colmap 不传时按表头自动解析（见 `resolve_columns`，支持别名/短名）。
     返回 [{'date','reach','impressions','frequency','clicks','cpc','cpm',
             'budget','btype','spend','add_to_cart','initiate_checkout',
             'purchase','add_payment_info','purchase_value'}, ...]
+
+    ⚠️ 这里**不做**缺列校验（它是个纯转换函数）。要校验用 `check_csv_columns` /
+    `load_csv_grouped(strict=True)` —— 校验放在入口，别让安静的函数偷偷兜底。
     """
+    if not rows:
+        return []
+    if colmap is None:
+        colmap = resolve_columns(list(rows[0].keys()))
     out = []
     for r in rows:
         d = {}
-        for k, col in CSV_FIELDS.items():
-            v = r.get(col)
+        for k in REQUIRED_KEYS:
+            col = colmap.get(k)
+            v = r.get(col) if col else None
             if k in ('date', 'btype'):
                 d[k] = '' if v is None else str(v)
             else:
@@ -228,19 +364,72 @@ def extract_features(rows=None, snapshot=None):
     return feat, [feat[k] for k in FEATURE_KEYS]
 
 
-def load_csv_grouped(path):
-    """把一份 Ads Manager 逐日 CSV 按「广告系列名称」分组。
+GROUP_ALIASES = ['广告系列名称', '系列名称', '系列', 'campaign_name',
+                 '广告名称', '广告名', 'ad_name']
+ID_ALIASES = ['广告系列 ID', '广告系列id', '广告 ID', '广告id', '广告ID',
+              'campaign_id', 'ad_id', 'id']
 
-    返回 Ordered-ish dict: {name: [逐日行, ...]}（行已按日期排序）。
+
+def resolve_col(header, aliases):
+    """按别名优先级找列，返回命中的原始列名或 None。精确匹配（归一化后）。"""
+    idx = {}
+    for h in header:
+        idx.setdefault(norm_col(h), h)
+    for n in aliases:
+        if norm_col(n) in idx:
+            return idx[norm_col(n)]
+    return None
+
+
+def resolve_group_col(header):
+    """找分组列：优先广告系列，退而求其次用广告名。都没有返回 None。"""
+    return resolve_col(header, GROUP_ALIASES)
+
+
+def read_grouped_rows(path, strict=True, quiet=False):
+    """读一份 Ads Manager 导出 → 按广告系列（或广告）分组。
+
+    返回 (groups, meta)：
+        groups = {组名: [逐日行, ...]}，组内按日期排序
+        meta   = {'header','group_col','date_col','colmap','missing','unknown'}
+
+    缺必需列：strict=True 抛 `ColumnError`；strict=False 只在 stderr 告警。
+    **不再静默把缺列当 0** —— 这是本函数存在的意义。
     """
-    with io.open(path, encoding='utf-8-sig') as f:
-        rows = list(csv.DictReader(f))
+    rows = read_csv_rows(path)
+    if not rows:
+        return {}, {'header': [], 'group_col': None, 'date_col': None, 'id_col': None,
+                    'colmap': {}, 'missing': [], 'unknown': []}
+    header = list(rows[0].keys())
+    miss, cm, unknown = missing_columns(header)
+    if miss:
+        if strict:
+            raise ColumnError(_missing_msg(miss, path))
+        if not quiet:
+            sys.stderr.write('[table_judger] %s\n' % _missing_msg(miss, path))
+    gc = resolve_group_col(header)
+    if gc is None:
+        raise ColumnError(
+            '找不到分组列：需要「广告系列名称」或「广告名称」之一。文件：%s' % path)
+    dc = cm.get('date')
     g = {}
     for r in rows:
-        g.setdefault(r.get('广告系列名称', ''), []).append(r)
+        g.setdefault(str(r.get(gc, '')), []).append(r)
     for k in g:
-        g[k].sort(key=lambda z: z.get('报告开始日期', ''))
-    return g
+        g[k].sort(key=lambda z: str(z.get(dc, '') if dc else ''))
+    return g, {'header': header, 'group_col': gc, 'date_col': dc,
+               'id_col': resolve_col(header, ID_ALIASES),
+               'colmap': cm, 'missing': miss, 'unknown': unknown}
+
+
+def load_csv_grouped(path, strict=True, quiet=False):
+    """把一份 Ads Manager 逐日 CSV 按「广告系列名称」分组。
+
+    返回 {name: [逐日行, ...]}（行已按日期排序）。
+    默认做缺列校验（strict=True）—— 缺必需列抛 `ColumnError`，
+    而不是安静地把字段当 0。见 `read_grouped_rows` / `check_csv_columns`。
+    """
+    return read_grouped_rows(path, strict=strict, quiet=quiet)[0]
 
 
 # ==================== 3. 标签口径 ====================
