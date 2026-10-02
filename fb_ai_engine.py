@@ -768,3 +768,80 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         stats['nominated'] += 1
 
     return suggestions, stats
+
+
+# ---------- 学习型判断层接入（2026-10-02）----------
+# 目标：让「从历史结局里学」的表格模型（table_judger.TableJudger）能
+#   ① 与 LLM 并行出建议，② 或直接替换 LLM 的动作。
+# 默认 JUDGER_POLICY = 'llm' —— **不接入、行为与本改动之前完全一致**。
+#
+# 分工（不要绕）：
+#   表格模型只产出动作；理由/矛盾仍由 LLM 写；加预算两路都只能提名；
+#   无论哪条路，最终都要过 enforce_risk_guardrails（护栏压在所有模型之上）。
+JUDGER_POLICY = 'llm'          # 'llm'（默认，不接入）| 'model'（模型替换）| 'blend'（有把握才用模型）
+
+
+def make_table_judger(config=None, store_path=None):
+    """按配置构造并加载表格模型。**没装 sklearn 时返回 None**（生产不因此崩）。
+
+    返回的模型可能处于「未上岗」状态（标签不足）—— 那正是设计，它会自己回退规则。
+    """
+    try:
+        from table_judger import TableJudger
+    except ImportError:
+        return None
+    cfg = config or {}
+    j = TableJudger(min_labels=int(cfg.get('judger_min_labels', 80) or 80),
+                    min_confidence=float(cfg.get('judger_min_confidence', 0.55) or 0.55),
+                    config=cfg, store_path=store_path)
+    try:
+        j.load_from_store()
+    except RuntimeError:
+        # 标签够了但环境没 sklearn：保持未上岗，继续回退规则，不抛给生产
+        pass
+    return j
+
+
+def blend_with_judger(suggestions, snapshots, judger, policy=None, config=None):
+    """按 policy 把表格模型的判断合并进 LLM 建议。返回 (suggestions, stats)。
+
+      policy='llm'   → 原样返回（默认；不碰 LLM 的任何结论）
+      policy='model' → 用模型的动**替换** LLM 的动作（LLM 原判写进 reason 留痕）
+      policy='blend' → 仅在模型「已上岗且本条非弃权」时替换，否则保留 LLM
+
+    ⚠️ 本函数**不调护栏**：它只做合并。合并后的结果必须再走一次
+       enforce_risk_guardrails（护栏要在「合并之后」跑，否则会被合并覆盖回去）。
+    """
+    cfg = dict(config or {})
+    pol = str(policy or cfg.get('judger_policy') or JUDGER_POLICY).lower()
+    stats = {'policy': pol, 'replaced': 0, 'model_ready': False, 'model_sugg': 0}
+    if not suggestions or judger is None or pol == 'llm':
+        return suggestions, stats
+
+    stats['model_ready'] = bool(getattr(judger, 'is_ready', lambda: False)())
+    model_sugg = judger.judge(snapshots, cfg, apply_guardrail=False)
+    stats['model_sugg'] = len(model_sugg)
+    by_id = {str(s.get('campaign_id')): s for s in model_sugg}
+
+    for s in suggestions:
+        ms = by_id.get(str(s.get('campaign_id')))
+        if not ms:
+            continue
+        usable = (pol == 'model') or (pol == 'blend' and stats['model_ready']
+                                      and ms.get('source') == 'table_model')
+        if not usable:
+            continue
+        old = s.get('action')
+        if old == ms['action']:
+            continue
+        s['llm_action'] = old
+        s['action'] = ms['action']
+        s['budget_change_pct'] = 0 if ms['action'] != 'increase_budget' else ms.get('budget_change_pct', 0)
+        s['judger_source'] = ms.get('source')
+        s['reason'] = ('【表格模型改判｜%s】%s（LLM 原判「%s」）'
+                       % (ms.get('source'), ms.get('reason', ''),
+                          ACTION_CN.get(old, old)))
+        if ms.get('nomination') and ms['action'] == 'increase_budget':
+            s['nomination'] = ms['nomination']
+        stats['replaced'] += 1
+    return suggestions, stats

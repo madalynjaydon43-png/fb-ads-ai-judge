@@ -39,9 +39,25 @@ def num(x):
 
 
 # 最新落盘 = 新轮（按修改时间）
+#
+# ⚠️ `_out/` 是「真喂模型」的落盘产物，属于本机实验记录，**不随仓库发布**。
+#    公开仓库里没有它 —— 所以这里必须优雅跳过并讲清原因，
+#    否则别人 clone 下来第一件事就是 FileNotFoundError，会以为仓库坏了。
+_HINT = ('跳过：本脚本对比的是两轮「真喂 AI」的落盘结果，需要 _out/ 目录'
+         '（本机实验产物，不随仓库发布）。要直接看结论，读 docs/evidence/_v12_compare_out.txt。')
+if not os.path.isdir(OUTDIR):
+    print(_HINT)
+    sys.exit(0)
 cands = [os.path.join(OUTDIR, f) for f in os.listdir(OUTDIR)
          if f.startswith('测试结果-') and f.endswith('.json')]
 cands.sort(key=lambda p: os.path.getmtime(p))
+if not cands:
+    print(_HINT.replace('需要 _out/ 目录', '_out/ 里没有 测试结果-*.json'))
+    sys.exit(0)
+if not os.path.exists(OLD):
+    print('跳过：找不到基线 %s（无 net_view 那一轮的落盘）。'
+          '要直接看结论，读 docs/evidence/_v12_compare_out.txt。' % os.path.basename(OLD))
+    sys.exit(0)
 NEW = cands[-1]
 
 say('=' * 78)

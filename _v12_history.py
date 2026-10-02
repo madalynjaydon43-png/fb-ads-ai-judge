@@ -49,6 +49,11 @@ def pay(t, act):
 CN2 = {'stop': '暂停', 'observe': '观察', 'up': '加预算'}
 
 rows = []
+# ⚠️ `_out/` 是本机「真喂模型」的落盘记录，不随仓库发布。缺它时明确跳过，别抛异常。
+if not os.path.isdir(OUTDIR):
+    print('跳过：本脚本要给 _out/ 里的历史轮次对账，而 _out/ 不随仓库发布（本机实验产物）。'
+          '要直接看结论，读 docs/evidence/_v12_history_out.txt。')
+    raise SystemExit(0)
 for fn in os.listdir(OUTDIR):
     if not (fn.startswith('测试结果-') and fn.endswith('.json')):
         continue

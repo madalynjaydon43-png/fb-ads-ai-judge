@@ -6,6 +6,8 @@ config.local.json
 
 # 跑出来的中间产物
 _out/
+learning_store.jsonl
+learning_store.jsonl.tmp
 ai_test_history.json
 ai_test_zero_spend_skipped.json
 ai_history.json

@@ -15,7 +15,7 @@ from datetime import datetime
 from fb_ai_engine import (
     AI_CONFIG_DEFAULTS, make_snapshot, build_prompt,
     call_llm, parse_suggestions, apply_guardrails,
-    enforce_risk_guardrails,
+    enforce_risk_guardrails, blend_with_judger, make_table_judger,
 )
 
 # 上游报错里的「reset after 16s / reset after 1m 1s」= 限流窗口剩余时间
@@ -55,7 +55,7 @@ _AI_RUN_LOCK = threading.Lock()
 class AdsAiScheduler:
     def __init__(self, get_insights_fn, config_path=None, log_fn=print,
                  history_path=None, zero_spend_path=None,
-                 config_override=None, window=None):
+                 config_override=None, window=None, judger=None):
         """
         get_insights_fn: 函数，返回系列洞察列表（list of dict，需含 id/name/status/spend/
                          impressions/clicks/cpc/cpm/purchase/purchase_value/cost_per_purchase
@@ -72,6 +72,11 @@ class AdsAiScheduler:
                       「最近 7 天」和文件里的 7 天不是同一段日期。
         window: (start_date, end_date) 字符串元组，直接作为 prompt 里的数据口径声明。
                       None = 按 lookback_days 从今天往前推（生产默认）。
+
+        judger: 可选的「学习型判断层」实例（table_judger.TableJudger）。
+                None（默认）= 不接入，行为与改动前完全一致。
+                传了实例时，是否真的生效还取决于 config['judger_policy']
+                （'llm'/'model'/'blend'），见 fb_ai_engine.blend_with_judger。
         """
         self.get_insights_fn = get_insights_fn
         self.log_fn = log_fn
@@ -81,6 +86,7 @@ class AdsAiScheduler:
         self.zero_spend_path = zero_spend_path or os.path.join(self.script_dir, "ai_zero_spend_skipped.json")
         self.config_override = dict(config_override or {})
         self.window = tuple(window) if window else None
+        self.judger = judger          # 学习型判断层（None = 不接入，行为不变）
         self.suggestions = []
         self.last_run = None
         self.last_error = None
@@ -434,6 +440,16 @@ class AdsAiScheduler:
                          f"模型实际给出 {len(snapshot) - len(missing)}/{len(snapshot)}", "WARNING")
             else:
                 self.log(f"覆盖率 100%：{len(snapshot)} 条全部由模型给出结论")
+
+            # ---------- 学习型判断层（2026-10-02；默认 judger=None 时不生效）----------
+            # 位置必须在「覆盖率兜底之后」：模型要对着补全成 N 条的完整清单改判，
+            # 否则兜底补出来的条目会被漏掉（与护栏同一个坑）。
+            # 也必须在「护栏之前」：护栏是最后一道，压在 LLM 与模型两路之上。
+            sugg, jstat = blend_with_judger(sugg, snapshot, self.judger, config=config)
+            if jstat['replaced']:
+                self.log(f"表格模型改判 {jstat['replaced']} 条（policy={jstat['policy']}，"
+                         f"模型上岗={jstat['model_ready']}，模型建议 {jstat['model_sugg']} 条）")
+            timing['judger'] = jstat
 
             # ---------- 关停护栏 + 加预算提名（2026-10-02）----------
             # ⚠️ 必须在这之后：护栏要对着「已经补全成 N 条」的结论跑，
