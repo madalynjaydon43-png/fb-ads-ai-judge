@@ -1093,9 +1093,13 @@ class TestP1bSignals(unittest.TestCase):
         for needle in ('video_avg_watch_sec', 'video_watch_days',
                        'repeat_click_ratio', 'repeat_click_days'):
             self.assertIn(needle, p)
-        # 两条「不许拿它当关停理由」的边界必须写进 prompt，否则会被挪用到别的动作上
-        self.assertIn('不得因此给 decrease_budget', p)
-        self.assertIn('不是独立的关停理由', p)
+        # ⚠️ 这两条断言在 2026-10-03 被**加强**过：原措辞是「不得因此给 decrease_budget」——
+        #   那个措辞有个大洞：通篇**没禁 pause**，而三轮盲测全都判了 pause。
+        #   等于只禁了一半，另一半形同虚设。详见 TestLossAttributionPrompt 的
+        #   test_rules_have_no_escape_hatch。
+        self.assertIn('都不许给', p)
+        self.assertIn('落地页、价格、信任这一环查过了吗', p)
+        self.assertIn('净额为负不构成关停理由', p)
 
     # ---------- 真实数据 ----------
     def test_real_adset_export(self):
@@ -1313,6 +1317,38 @@ class TestLossAttributionPrompt(unittest.TestCase):
     def test_flag_section_empty_when_no_signal(self):
         snaps = [self._snap('丁')]
         self.assertEqual(eng._flag_section(snaps), '')
+
+    def test_rules_have_no_escape_hatch(self):
+        """🔴 钉死一条教训：**规则里留「结合 X 再定」这种尾巴 = 没写禁令。**
+
+        2026-10-03 双盲复盘：重复点击那条规则原文是
+            「不得**仅凭它**给 pause，但**必须结合 net_view.net 的正负再定**」
+        —— 而那两条广告的 net 恰好都是负的，**规则字面上就允许 pause**。
+        于是三轮盲测全都「正确地遵守了规则」却仍然误杀。
+        观看时长那条更松：通篇只禁了 decrease_budget，**pause 从来没被禁**。
+
+        所以这两条现在必须是**无条件的禁令**，且不能出现「再定」「酌情」这类退路。
+        """
+        p = eng.build_prompt([self._snap()], {}, window=('2026-04-01', '2026-04-05'))
+        i = p.find('repeat_click_ratio = 非独立点击数')
+        j = p.find('判「亏在哪」')
+        seg = p[i:j]
+        self.assertIn('落地页、价格、信任这一环查过了吗', seg)
+        self.assertIn('净额为负不构成关停理由', seg)
+        self.assertNotIn('必须结合 net_view.net 的正负再定', seg,
+                         '旧版那句是逃生口，必须已经删掉')
+        # 观看时长那条必须**显式禁 pause**（原来只禁了 decrease_budget）
+        k = p.find('video_avg_watch_sec = 观众平均看了几秒')
+        seg2 = p[k:i]
+        self.assertIn('都不许给', seg2)
+        self.assertIn('pause', seg2)
+
+    def test_pause_is_framed_as_irreversible(self):
+        """对冲「先停损」这个本能：把关停的代价算出来，而不是只喊「别关」。"""
+        p = eng.build_prompt([self._snap()], {}, window=('2026-04-01', '2026-04-05'))
+        self.assertIn('pause 是不可逆动作', p)
+        self.assertIn('先停损再修', p)
+        self.assertIn('已经试过什么、为什么不管用', p)
 
 
 if __name__ == '__main__':
