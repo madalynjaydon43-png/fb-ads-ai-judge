@@ -29,30 +29,49 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 
 # ---------- 列名映射（尽量吃下 Ads Manager 各种导出变体） ----------
-# 每组都按「越具体越靠前」排；匹配是归一化后**精确相等**（见 _Row.pick），不是子串。
-# 末尾那批单字/双字名，是本仓库 pull_real3.py 拍平的短名格式（真实导出用的那一套）。
 COL_DATE = ['报告开始日期', '日期', 'date', 'day']
 COL_AD = ['广告名称', '广告名', 'ad_name', 'ad name']
 COL_AD_ID = ['广告 ID', '广告id', 'ad_id', 'ad id']
-COL_CAMP = ['广告系列名称', '系列名称', 'campaign_name', '系列']
+COL_CAMP = ['广告系列名称', '系列名称', 'campaign_name']
 COL_STATUS = ['广告状态', '广告投放', '广告系列投放', '投放状态', 'status']
 COL_OBJ = ['广告系列目标', '广告目标', 'objective']
-COL_METRIC = ['成效指标', 'results_indicator', '成效']
-COL_SPEND = ['已花费金额 (USD)', '已花费金额', '花费金额', '金额 (USD)', 'spend', '花费']
-COL_IMP = ['展示次数', '展示量', 'impressions', '展示']
-COL_REACH = ['覆盖人数', '触达人数', 'reach', '覆盖']
-COL_CLICK = ['链接点击量', '链接点击次数', 'inline_link_clicks', 'clicks', '链接点击']
-COL_CPC = ['单次链接点击费用 (USD)', '单次链接点击费用', 'cpc', 'CPC']
-COL_CPM = ['CPM（千次展示费用） (USD)', 'CPM (USD)', 'CPM（千次展示费用）', 'cpm', 'CPM']
-COL_CART = ['加入购物车次数', '加购次数', 'add_to_cart', '加购']
-COL_CHECKOUT = ['结账发起次数', '发起结账次数', 'initiate_checkout', '结账']
-COL_PURCH = ['购物次数', '购买次数', 'purchase', '购买']
-COL_PAY = ['添加支付信息', '添加支付信息次数', 'add_payment_info', '支付信息']
-COL_PVAL = ['购物转化价值', '购买转化价值', 'purchase_value', '购买价值']
+COL_METRIC = ['成效指标', 'results_indicator', '优化事件']
+# ⚠️ 别把「成效」列放进别名表：那是**数字列**（这一行有几次成效），
+#    而「成效指标」是**文本列**（优化的是购买还是加购）。混在一起会让
+#    metric_sample 变成 '1' 这种数字，_infer_objective 就推不出目标了。
+COL_SPEND = ['已花费金额 (USD)', '已花费金额', '花费金额', '金额 (USD)', 'spend']
+COL_IMP = ['展示次数', '展示量', 'impressions']
+COL_REACH = ['覆盖人数', '触达人数', 'reach']
+COL_CLICK = ['链接点击量', '链接点击次数', 'inline_link_clicks', 'clicks']
+COL_CPC = ['单次链接点击费用 (USD)', '单次链接点击费用', 'cpc']
+COL_CPM = ['CPM（千次展示费用） (USD)', 'CPM (USD)', 'CPM（千次展示费用）', 'cpm']
+COL_CART = ['加入购物车次数', '加购次数', 'add_to_cart']
+COL_CHECKOUT = ['结账发起次数', '发起结账次数', 'initiate_checkout']
+COL_PURCH = ['购物次数', '购买次数', 'purchase']
+COL_PAY = ['添加支付信息', '添加支付信息次数', 'add_payment_info']
+COL_PVAL = ['购物转化价值', '购买转化价值', 'purchase_value']
 COL_VIEW = ['内容查看次数', '落地页浏览量', '内容查看', 'view_content', 'landing_page_view']
 COL_ADSET_BUDGET = ['广告组预算', 'adset_budget']
-COL_ADSET_BUDGET_TYPE = ['广告组预算类型', '广告系列预算类型', 'adset_budget_type', '预算类型']
+COL_ADSET_BUDGET_TYPE = ['广告组预算类型', 'adset_budget_type']
 COL_CAMP_BUDGET = ['广告系列预算', '系列预算', 'campaign_budget']
+# ---- P0/P1 新增：口径与竞争对照列（2026-10-02）----
+# 这三列的意义不是「再多一个数字」，而是**决定已有数字该怎么读**：
+#   · 归因设置  → 同一份 spend/ROAS 在不同窗口下不可比（7d_click vs 1d_view 差很多）
+#   · 成效指标  → 这条广告组优化的到底是「购买」还是「加购」；优化加购的广告天生买得少，
+#                 拿「购买少」去关它是误杀
+#   · 质量/互动率/转化率排名 → 唯一带「竞争对照」的信号（和抢同批受众的广告比）。
+#                 注意：Meta 只在有足够投放时给排名，没跑起来的广告这一列是 '-'（空）。
+COL_ATTR = ['归因设置', 'attribution_setting', 'attribution']
+COL_METRIC_RAW = ['成效指标', 'results_indicator', '优化事件', 'optimization_goal']
+COL_RANK_QUALITY = ['质量排名', 'quality_ranking']
+COL_RANK_ENGAGE = ['互动率排名', 'engagement_rate_ranking']
+COL_RANK_CONV = ['转化率排名', 'conversion_rate_ranking']
+COL_END_DATE = ['结束日期', 'end_date', 'end_time']
+COL_COST_THRUPLAY = ['单次 ThruPlay 费用 (USD)', '单次 ThruPlay 费用', 'cost_per_thruplay']
+
+# 空值哨兵：Ads Manager 用 '-' / '--' / '' 表示「这项没有数据」，
+# 与「真实的 0」是两回事，绝不能混为一谈（排名的 '-' ≠ 排名最差）。
+_EMPTY_TOKENS = ('', '-', '--', '—', 'n/a', 'na', 'null', 'none', '不适用')
 
 
 class LoadError(Exception):
@@ -127,6 +146,20 @@ def _read_xlsx(path):
         rows.append({header[i]: ('' if v is None else v) for i, v in enumerate(r) if i < len(header)})
     wb.close()
     return rows
+
+
+def _text_or_none(v):
+    """取文本值；Ads Manager 的空值哨兵（'-' / '' / 'n/a' …）一律返回 None。
+
+    为什么必须区分：排名列的 '-' 表示「Meta 没有给出排名」（通常是投放量不够），
+    不是「排名等于某个值」。若当成普通文本传下去，AI 会把 '-' 当成一种排名档位来解读。
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s.lower() in _EMPTY_TOKENS:
+        return None
+    return s
 
 
 def _infer_objective(metric):
@@ -243,6 +276,13 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
         camp_budget = None
         adset_budget_type = ''
         metric_sample = ''
+        # P0/P1：口径与竞争对照（整条广告取首个非空值 —— 这些列逐日重复）
+        attribution = None
+        rank_quality = None
+        rank_engage = None
+        rank_conv = None
+        end_date = None
+        cost_thruplay = None
         first_date = str(days_sorted[0].pick(COL_DATE))[:10]
 
         for d in days_sorted:
@@ -270,6 +310,19 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
                 camp_budget = _num(d.pick(COL_CAMP_BUDGET), float, None)
             if not adset_budget_type and d.pick(COL_ADSET_BUDGET_TYPE):
                 adset_budget_type = str(d.pick(COL_ADSET_BUDGET_TYPE)).strip()
+            # P0/P1：空值哨兵 '-' 一律读成 None（= 没有这项数据），不当成取值
+            if attribution is None:
+                attribution = _text_or_none(d.pick(COL_ATTR))
+            if rank_quality is None:
+                rank_quality = _text_or_none(d.pick(COL_RANK_QUALITY))
+            if rank_engage is None:
+                rank_engage = _text_or_none(d.pick(COL_RANK_ENGAGE))
+            if rank_conv is None:
+                rank_conv = _text_or_none(d.pick(COL_RANK_CONV))
+            if end_date is None:
+                end_date = _text_or_none(d.pick(COL_END_DATE))
+            if cost_thruplay is None and d.pick(COL_COST_THRUPLAY) not in (None, ''):
+                cost_thruplay = _num(d.pick(COL_COST_THRUPLAY), float, None)
 
             tot['spend'] += spend
             tot['imp'] += imp
@@ -331,7 +384,7 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
         if obj and not obj.startswith('OUTCOME_') and obj.upper() in ('SALES', 'ENGAGEMENT', 'TRAFFIC', 'AWARENESS'):
             obj = 'OUTCOME_' + obj.upper()
 
-        out.append({
+        rec = {
             'id': ident,
             'name': name,
             'status': (status or 'ACTIVE').upper(),
@@ -356,7 +409,25 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
             'view_content': tot['view'],
             'start_time': first_date + 'T00:00:00+0800',
             'daily_spend': daily,
-        })
+        }
+        # ---- P0/P1：只带非空项（Graph API 缺字段时也是不带）----
+        # 这些字段的意义是「决定别的数字怎么读」，不是再加一个数字：
+        #   attribution        归因窗口（7d_click / 1d_view …）—— 跨窗口的 ROAS 不可比
+        #   optimization_event 这个广告组在优化什么 —— 优化加购的广告不因「购买少」被关
+        #   rankings           质量 / 互动率 / 转化率排名 —— 唯一的竞争对照；缺 = 投放量不够
+        if attribution:
+            rec['attribution'] = attribution
+        if metric_sample:
+            rec['optimization_event'] = metric_sample
+        if rank_quality or rank_engage or rank_conv:
+            rec['rankings'] = {k: v for k, v in (
+                ('quality', rank_quality), ('engagement', rank_engage),
+                ('conversion', rank_conv)) if v}
+        if end_date:
+            rec['end_date'] = end_date
+        if cost_thruplay is not None:
+            rec['cost_per_thruplay'] = cost_thruplay
+        out.append(rec)
 
     statuses = {}
     for r in out:
@@ -372,6 +443,22 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
     if n_nobudget:
         gaps.add('其中 %d 条完全没有预算数字（导出里两列都空）→ AI 无法判断「花费离预算还有多远」。'
                  % n_nobudget)
+
+    # P0/P1 缺口声明：排名列「有列但全空」与「根本没有这列」是两回事，都必须明说——
+    # 否则 AI 会把「Meta 没给排名」读成「排名很差」，或把「没这列」读成「排名为 0」。
+    has_rank_col = (probe.has(COL_RANK_QUALITY) or probe.has(COL_RANK_ENGAGE)
+                    or probe.has(COL_RANK_CONV))
+    n_no_rank = sum(1 for r in out if not r.get('rankings'))
+    if has_rank_col and n_no_rank:
+        gaps.add('质量/互动率/转化率排名：导出里有这几列，但 %d/%d 条是空的（Ads Manager 显示 "-"）。'
+                 'Meta 只在投放量足够时才给排名 —— 空 = 没有这项数据，**不是排名差**。'
+                 % (n_no_rank, len(out)))
+    elif not has_rank_col:
+        gaps.add('质量/互动率/转化率排名：本文件没有这三列 → 没有「和同场竞品比」的对照信息，'
+                 '判断只能基于自身数字，不得断言「这条比同行好/差」。')
+    if not probe.has(COL_ATTR):
+        gaps.add('归因设置：本文件没有这一列 → 归因窗口未知，'
+                 '跨来源的 ROAS / 购买数不可直接比大小。')
 
     meta = {
         'file': os.path.basename(path),

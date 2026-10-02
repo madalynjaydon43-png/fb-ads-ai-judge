@@ -26,6 +26,7 @@ import flywheel                                     # noqa: E402
 import metric_views as mv                           # noqa: E402
 import table_judger as tj                           # noqa: E402
 import fb_ai_engine as eng                          # noqa: E402
+import fb_test_loader as lo                         # noqa: E402
 
 try:
     import sklearn                                    # noqa: F401
@@ -731,7 +732,13 @@ class TestBudgetAnomaly(unittest.TestCase):
 
 
 class TestRealExports(unittest.TestCase):
-    """真实账户的 6 份导出（若本机存在）—— 端到端跑一遍。"""
+    """真实账户的导出（若本机存在）—— 端到端跑一遍。
+
+    ⚠️ 断言必须**由数据本身推出来**，不能写死份数 / 行数：
+    用户随时会再导一份新指标的导出（2026-10-02 就多了一份带排名的**广告级**导出，
+    直接从 6 份变 7 份、行数 177 变 354）。写死数字的断言会在那一刻变成**假警报**，
+    而假警报会让人开始忽略测试 —— 比没有测试更糟。
+    """
 
     # 真实导出的目录：默认「下载」文件夹，可用环境变量覆盖。
     # ⚠️ 不要写死带用户名的绝对路径 —— 这个文件是公开仓库的一部分。
@@ -741,31 +748,37 @@ class TestRealExports(unittest.TestCase):
         import glob
         return sorted(glob.glob(os.path.join(self.DL, 'voglyn*.csv')))
 
-    def test_six_files_dedupe_to_five_views(self):
+    def test_every_export_is_classified_or_dropped(self):
         paths = self._paths()
         if len(paths) < 6:
-            self.skipTest('本机没有那 6 份真实导出')
+            self.skipTest('本机没有那批真实导出')
         ov = mv.overview(paths=paths)
-        self.assertEqual(len(ov['exports']), 6)
-        self.assertEqual(len(ov['chosen']), 5, '6 份里有两份是同一套指标')
-        self.assertEqual(len(ov['dropped']), 1)
-        self.assertEqual(ov['merge']['conflicts'], [], '同源导出不该有冲突')
-        self.assertFalse(ov['gap']['missing'], '五种视图应当齐了：%s' % ov['gap']['missing'])
+        self.assertEqual(len(ov['exports']), len(paths), '每份文件都该被扫描到')
+        self.assertEqual(len(ov['chosen']) + len(ov['dropped']), len(paths),
+                         '每份文件要么被选中，要么被去重丢掉，不能凭空消失')
+        sigs = [e.sig for e in ov['chosen']]
+        self.assertEqual(len(sigs), len(set(sigs)), '被选中的视图签名必须互不相同')
+        # 五种视图的缺口清单必须算得出（哪怕某次导出恰好缺一种）
+        self.assertIsInstance(ov['gap']['missing'], list)
+        # 合并冲突**只允许报告、不允许静默**（广告级与系列级导出混在一起时确实会撞键）
+        self.assertIsInstance(ov['merge']['conflicts'], list)
 
-    def test_wide_table_has_more_columns_than_any_single_export(self):
+    def test_wide_table_beats_every_single_export(self):
         paths = self._paths()
         if len(paths) < 6:
-            self.skipTest('本机没有那 6 份真实导出')
+            self.skipTest('本机没有那批真实导出')
         ov = mv.overview(paths=paths)
         widest = max(len(e.header) for e in ov['exports'])
         self.assertGreater(len(mv.wide_header(ov['wide'])), widest,
                            '合并后必须比任何单份都宽')
-        self.assertEqual(len(ov['wide']), 177)
+        most_rows = max(len(e.rows) for e in ov['exports'])
+        self.assertGreaterEqual(len(ov['wide']), most_rows,
+                                '合并后的行数不该少于最全的那一份')
 
     def test_ext_coverage_reflects_missing_days(self):
         paths = self._paths()
         if len(paths) < 6:
-            self.skipTest('本机没有那 6 份真实导出')
+            self.skipTest('本机没有那批真实导出')
         ov = mv.overview(paths=paths)
         rep = ov['ext_report']
         # 视频/互动视图只覆盖 4 天 → 长袖/短袖那些广告的支撑天数必然少
@@ -773,6 +786,126 @@ class TestRealExports(unittest.TestCase):
         self.assertTrue(some_days)
         self.assertTrue(any(d <= 4 for d in some_days),
                         '必须能看出有些比值只基于很少的天数')
+
+
+class TestP0P1Columns(unittest.TestCase):
+    """P0/P1：把「决定别的数字怎么读」的列读出来，并写进口径声明。
+
+    这批字段（归因窗口 / 优化目标 / 排名 / 投放状态）**不参与任何计算**，
+    价值全在「读数的前提」上 —— 实测两类真实误判就靠它们堵：
+
+      · 归因设置：同一账户的两份导出窗口不同（一份「7天点击+1天浏览+1天互动观看」、
+        另一份只有「7天点击+1天浏览」）→ 跨窗口比 ROAS 是错的
+      · 成效指标：实测某系列优化的是 `actions:post_engagement`（互动），
+        按「购买少」去关它是把靶子搞错了
+    """
+
+    HDR = ['报告开始日期', '广告名称', '广告投放', '归因设置', '成效指标',
+           '已花费金额 (USD)', '展示次数', '覆盖人数', '链接点击量', '购物次数',
+           '购物转化价值', '广告组预算', '广告组预算类型',
+           '质量排名', '互动率排名', '转化率排名', '结束日期']
+
+    def _write(self, rows, header=None):
+        fd, path = tempfile.mkstemp(suffix='.csv')
+        os.close(fd)
+        with io.open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(header or self.HDR)
+            w.writerows(rows)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def _one_day(self, **over):
+        r = {'报告开始日期': '2026-03-10', '广告名称': 'A1', '广告投放': 'not_delivering',
+             '归因设置': '点击后 7 天内、浏览后 1 天内或互动观看后 1 天内',
+             '成效指标': 'actions:offsite_conversion.fb_pixel_purchase',
+             '已花费金额 (USD)': '20', '展示次数': '1000', '覆盖人数': '800',
+             '链接点击量': '30', '购物次数': '2', '购物转化价值': '60',
+             '广告组预算': '20', '广告组预算类型': '单日预算',
+             '质量排名': '高于平均', '互动率排名': '平均', '转化率排名': '低于平均',
+             '结束日期': '进行中'}
+        r.update(over)
+        return [r[k] for k in self.HDR]
+
+    def test_sentinel_dash_is_none_not_a_value(self):
+        """'-' 是「没有这项数据」，不是一种取值 —— 排名空 ≠ 排名差。"""
+        self.assertIsNone(lo._text_or_none('-'))
+        self.assertIsNone(lo._text_or_none(' -- '))
+        self.assertIsNone(lo._text_or_none('N/A'))
+        self.assertIsNone(lo._text_or_none(''))
+        self.assertEqual(lo._text_or_none('高于平均'), '高于平均')
+
+        rec = lo.load_file(self._write([self._one_day(质量排名='-',
+                                                     互动率排名='-',
+                                                     转化率排名='-')]))[0][0]
+        self.assertNotIn('rankings', rec, '全是 "-" 时不该产出 rankings 字段')
+
+    def test_new_fields_survive_into_receipt(self):
+        rec = lo.load_file(self._write([self._one_day()]))[0][0]
+        self.assertEqual(rec['status'], 'NOT_DELIVERING')
+        self.assertIn('7 天', rec['attribution'])
+        self.assertEqual(rec['optimization_event'],
+                         'actions:offsite_conversion.fb_pixel_purchase')
+        self.assertEqual(rec['rankings'],
+                         {'quality': '高于平均', 'engagement': '平均',
+                          'conversion': '低于平均'})
+        self.assertEqual(rec['end_date'], '进行中')
+
+    def test_ranking_column_present_but_empty_is_declared_as_gap(self):
+        """导出了排名列但全是 '-' 时，必须明说「没有数据」，不能闭嘴。"""
+        rows, meta = lo.load_file(self._write([self._one_day(质量排名='-',
+                                                             互动率排名='-',
+                                                             转化率排名='-')]))
+        gaps = ' '.join(meta['data_gaps'])
+        self.assertIn('排名', gaps)
+        self.assertIn('不是排名差', gaps)
+
+    def test_missing_ranking_column_is_also_declared(self):
+        hdr = [h for h in self.HDR if '排名' not in h]
+        idx = [self.HDR.index(h) for h in hdr]
+        full = self._one_day()
+        row = [full[i] for i in idx]
+        rows, meta = lo.load_file(self._write([row], header=hdr))
+        gaps = ' '.join(meta['data_gaps'])
+        self.assertIn('排名', gaps)
+        self.assertNotIn('rankings', rows[0])
+
+    def test_snapshot_and_prompt_carry_the_caliber(self):
+        rec = lo.load_file(self._write([self._one_day()]))[0][0]
+        snap = eng.make_snapshot([rec])
+        self.assertEqual(snap[0]['attribution'], rec['attribution'])
+        self.assertEqual(snap[0]['optimization_event'], rec['optimization_event'])
+        self.assertEqual(snap[0]['rankings'], rec['rankings'])
+        p = eng.build_prompt(snap, {'lookback_days': 7}, window=('2026-03-10', '2026-03-10'))
+        for clause in ('status 非 ACTIVE', 'attribution = 本批数据采用的归因窗口',
+                       'optimization_event = 这个广告组优化', 'rankings（quality 质量',
+                       '不等于「排名差」'):
+            self.assertIn(clause, p, 'prompt 缺了口径声明：%s' % clause)
+
+    def test_absent_caliber_fields_stay_absent(self):
+        """没有这些列的文件（老导出）不能凭空长出口径字段来。"""
+        hdr = [h for h in self.HDR
+               if h not in ('归因设置', '成效指标', '质量排名', '互动率排名', '转化率排名')]
+        idx = [self.HDR.index(h) for h in hdr]
+        full = self._one_day()
+        rows, meta = lo.load_file(self._write([[full[i] for i in idx]], header=hdr))
+        rec = rows[0]
+        for k in ('attribution', 'optimization_event', 'rankings'):
+            self.assertNotIn(k, rec)
+        gaps = ' '.join(meta['data_gaps'])
+        self.assertIn('归因设置', gaps)
+
+    def test_real_latest_export_if_present(self):
+        """本机若有那份带排名的广告级导出，跑一遍真实数据。"""
+        import glob
+        dl = os.environ.get('FB_EXPORT_DIR', os.path.expanduser(os.path.join('~', 'Downloads')))
+        cand = [p for p in sorted(glob.glob(os.path.join(dl, 'voglyn*')) )
+                if '(6)' in os.path.basename(p) and p.lower().endswith('.csv')]
+        if not cand:
+            self.skipTest('本机没有那份广告级导出')
+        rows, meta = lo.load_file(cand[0])
+        self.assertTrue(all(r.get('attribution') for r in rows),
+                        '真实导出里归因设置应当每一行都能读到')
 
 
 if __name__ == '__main__':

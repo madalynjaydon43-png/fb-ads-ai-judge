@@ -310,6 +310,22 @@ def make_snapshot(campaigns_insights):
             _nv = _net_view(days, row.get('adset_daily_budget') or row.get('campaign_daily_budget'))
             if _nv:
                 row['net_view'] = _nv
+        # ---- P0/P1：口径与竞争对照（2026-10-02）----
+        # 只带非空项：缺了就不出现在快照里，prompt 会按「该字段未知」处理。
+        # 这三类字段不参与任何计算，只作为**读数的前提**进入 prompt：
+        #   attribution        归因窗口  → 跨窗口的 ROAS/购买不可比
+        #   optimization_event 优化目标  → 优化加购的广告不因「购买少」被关
+        #   rankings           竞争排名  → 唯一的外部对照（缺 = Meta 没给，≠ 差）
+        if c.get('attribution'):
+            row['attribution'] = c.get('attribution')
+        if c.get('optimization_event'):
+            row['optimization_event'] = c.get('optimization_event')
+        if c.get('rankings'):
+            row['rankings'] = c.get('rankings')
+        if c.get('end_date'):
+            row['end_date'] = c.get('end_date')
+        if c.get('cost_per_thruplay') is not None:
+            row['cost_per_thruplay'] = c.get('cost_per_thruplay')
         rows.append(row)
     return rows
 
@@ -362,6 +378,7 @@ def build_prompt(snapshot, config, window=None):
         "直接输出 JSON 数组，不要任何前缀文字、解释或思考过程。\n"
         f"你是资深 Facebook 广告投放优化师。**今天是 {today_str}**。下面是 {n} 条广告的数据快照：每条含汇总指标"
         "（spend / roas / 漏斗各环节 / ctr / cpm / frequency / 预算类型等）、**程序算好的样本量 sample**、"
+        "**口径与对照字段（status 投放状态 / attribution 归因窗口 / optimization_event 优化目标 / rankings 竞争排名）**、"
         "与**逐日明细 daily_spend**。\n"
         "【数据口径 —— 必须先读懂再判断】\n"
         f"  · 时间窗：**{window_start} ~ {today_str}**（最近 {lookback_days} 天）。每条广告顶层的 "
@@ -373,6 +390,21 @@ def build_prompt(snapshot, config, window=None):
         "  · 判断动作看**最近几天**的走势（爬升 / 持平 / 断崖），不要被窗口合计掩盖近期恶化。\n"
         "  · 若 daily_spend 最后一天（即今天）spend 为 0：说明它今天没在花钱 —— 此时**不需要 pause**"
         "（它本来就没花），给 observe 即可，但要在 reason 里点出「从哪天起停了」。\n"
+        "  · **status 非 ACTIVE（如 not_delivering / 已暂停 / 已结束）= 现在根本没在投**："
+        "它没有花钱、也拿不到新数据。此时**不得给 increase_budget**（花钱动作没有承接对象），"
+        "给 observe 并在 reason 里点出「当前未投放」。"
+        "（这条只约束花钱动作，不影响你如实描述它的历史表现。）\n"
+        "  · **attribution = 本批数据采用的归因窗口**（如「点击后 7 天内、浏览后 1 天内」）。"
+        "凡是提到 ROAS / 购买数 / 单均成本的横向对比，**都必须限定在同一窗口内**；"
+        "若某条的 attribution 与别人不同或缺失，只能各自内部前后比，**不得跨窗口排序**。"
+        "（这一列缺失时按「窗口未知」处理，**不要假定**是 7d_click。）\n"
+        "  · **optimization_event = 这个广告组优化的到底是哪个事件**（购买 / 加购 / 链接点击…）。"
+        "判断的靶子必须与它对齐：优化加购 / 结账 / 链接点击的广告组，购物次数天然少，"
+        "**不构成 pause / decrease_budget 的理由** —— 那是目标决定的，不是它跑得差。"
+        "（这一列缺失时按「目标未知」处理，退回 objective 字段判断。）\n"
+        "  · **rankings（quality 质量 / engagement 互动率 / conversion 转化率）= 和抢同批受众的广告比出来的排名**，"
+        "是唯一的外部对照：自身 CTR 3% 说明不了好坏，要看排名档位。"
+        "**rankings 缺失或为空 = Meta 没给这项数据（通常因为投放量不够），绝不等于「排名差」，不得据此下结论。**\n"
         + note_text +
         f"【硬性要求】必须对输入中的**每一条**广告都输出一条结论，共 **{n} 条**，一条不能少、不能合并、不能跳过。\n"
         "  表现正常、不需要动作的也必须输出，action 填 \"observe\"。宁可全给 observe，也绝不能漏掉任何一条 ——"

@@ -227,6 +227,23 @@ def cmd_check(args):
     if unknown:
         print()
         print('  没被用上的列（正常，导出通常带一堆不需要的）：%s' % '、'.join(unknown[:12]))
+        # P0/P1（2026-10-02）：有几列**不进 30 维模型、但要写进 prompt 当口径**。
+        # 不解释的话，它们会混在「没被用上」里，让人以为白导了。
+        CALIBER_COLS = {
+            '归因设置': '归因窗口 —— 跨窗口的 ROAS/购买数不可比',
+            '成效指标': '广告组到底在优化什么 —— 优化加购的不因「购买少」被关',
+            '质量排名': '竞争排名 —— 唯一的外部对照（空 = Meta 没给，≠ 差）',
+            '互动率排名': '竞争排名 —— 同上',
+            '转化率排名': '竞争排名 —— 同上',
+            '广告投放': '投放状态 —— 非「投放中」不给花钱动作',
+        }
+        hit = {k: v for k, v in CALIBER_COLS.items()
+               if any(k in str(h) for h in unknown)}
+        if hit:
+            print('  其中这几列**不进 30 维特征、但会写进 AI 的口径声明**（不是白导）：')
+            for k, v in hit.items():
+                print('    · %-8s %s' % (k, v))
+            print('  （30 维特征是不变式，改动会作废历史打分，所以口径类字段走 prompt 而不进模型。）')
     print()
     if not miss:
         print('结论：列齐全，可以直接喂。')
