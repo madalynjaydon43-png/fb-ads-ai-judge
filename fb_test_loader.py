@@ -362,7 +362,14 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
                 metric_sample = str(d.pick(COL_METRIC))
             if not objective and d.pick(COL_OBJ):
                 objective = str(d.pick(COL_OBJ)).strip()
-            if not status and d.pick(COL_STATUS):
+            if d.pick(COL_STATUS):
+                # 🔴 **取最后一天的状态，不是第一天。**
+                # 投放状态是**时点事实**：同一条广告在这个窗口里可能从 ACTIVE 变成 PAUSED
+                # （被暂停 / 预算耗尽 / 审核不过 / 手动关停）。
+                # 取第一个非空值会把「3 月在投、4 月已停」的广告报成 ACTIVE ——
+                # 而 prompt 明写「status 非 ACTIVE 不得给 increase_budget」，
+                # 等于把最该拦住的那条规则给绕了过去，还顺手给一条已停的广告建议加预算。
+                # 实测踩到：模拟数据 A7 前 3 天 ACTIVE、后 2 天 PAUSED，被读成 ACTIVE。
                 status = str(d.pick(COL_STATUS)).strip()
             if adset_budget is None and d.pick(COL_ADSET_BUDGET) not in (None, ''):
                 adset_budget = _num(d.pick(COL_ADSET_BUDGET), float, None)

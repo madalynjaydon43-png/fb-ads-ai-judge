@@ -40,3 +40,8 @@ __pycache__/
 # 模型权重
 _laya_model/
 _laya_result.json
+
+# 判卷依据：绝不入库（会让被测的 agent 直接读到答案）
+测试数据-5天/真值_*.csv
+测试数据-5天/答案表_*.csv
+测试数据-5天/设计说明.md

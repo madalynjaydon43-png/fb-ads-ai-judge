@@ -1052,6 +1052,40 @@ class TestP1bSignals(unittest.TestCase):
         rows, _ = lo.load_file(self._write([[vals.get(c, '') for c in hdr]], header=hdr))
         self.assertNotIn('video_avg_watch_sec', rows[0])
 
+    def test_status_takes_latest_day_not_first(self):
+        """投放状态是**时点事实** —— 必须取窗口里最后一天，不是第一天。
+
+        踩过的坑：模拟数据里 A7 前 3 天 ACTIVE、后 2 天 PAUSED，
+        加载器取「第一个非空值」⇒ 一条**已被暂停**的广告被报成 ACTIVE。
+        而 prompt 明写「status 非 ACTIVE 不得给 increase_budget」
+        ⇒ 等于把最该拦住的那条规则绕过去，还顺手给一条停投的广告建议加预算。
+        """
+        rows, _ = lo.load_file(self._write([
+            self._row({'报告开始日期': '2026-04-01', '广告组投放': 'ACTIVE'}),
+            self._row({'报告开始日期': '2026-04-02', '广告组投放': 'ACTIVE'}),
+            self._row({'报告开始日期': '2026-04-03', '广告组投放': 'PAUSED'}),
+        ]))
+        self.assertEqual(rows[0]['status'], 'PAUSED')
+
+    def test_status_empty_cell_does_not_fall_back_to_active(self):
+        """列在、但某天的值是空 —— 不能把状态「顶」回 ACTIVE。
+
+        区分两种情况：
+          · **整列都没有** → 真的没有状态信息，回退 ACTIVE 是既定行为（且要写进 data_gaps）
+          · **列在、某个格子空** → 那是「这天没填」，应沿用最近一次真实取值
+        """
+        v1 = dict(zip(self.HDR, self._row()))
+        v1['报告开始日期'] = '2026-04-01'
+        v1['广告组投放'] = 'PAUSED'
+        v2 = dict(zip(self.HDR, self._row()))
+        v2['报告开始日期'] = '2026-04-02'
+        v2['广告组投放'] = ''          # 空值哨兵，不是取值
+        v3 = dict(zip(self.HDR, self._row()))
+        v3['报告开始日期'] = '2026-04-03'
+        v3['广告组投放'] = ''          # 末天空着，也不能丢掉前面读到的 PAUSED
+        rows, _ = lo.load_file(self._write([[d[k] for k in self.HDR] for d in (v1, v2, v3)]))
+        self.assertEqual(rows[0]['status'], 'PAUSED')
+
     # ---------- prompt ----------
     def test_prompt_declares_how_to_read_new_signals(self):
         rows, _ = lo.load_file(self._write([self._row()]))
