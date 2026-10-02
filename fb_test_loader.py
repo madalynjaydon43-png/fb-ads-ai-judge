@@ -33,7 +33,7 @@ COL_DATE = ['报告开始日期', '日期', 'date', 'day']
 COL_AD = ['广告名称', '广告名', 'ad_name', 'ad name']
 COL_AD_ID = ['广告 ID', '广告id', 'ad_id', 'ad id']
 COL_CAMP = ['广告系列名称', '系列名称', 'campaign_name']
-COL_STATUS = ['广告状态', '广告投放', '广告系列投放', '投放状态', 'status']
+COL_STATUS = ['广告状态', '广告投放', '广告组投放', '广告系列投放', '投放状态', 'status']
 COL_OBJ = ['广告系列目标', '广告目标', 'objective']
 COL_METRIC = ['成效指标', 'results_indicator', '优化事件']
 # ⚠️ 别把「成效」列放进别名表：那是**数字列**（这一行有几次成效），
@@ -68,6 +68,19 @@ COL_RANK_ENGAGE = ['互动率排名', 'engagement_rate_ranking']
 COL_RANK_CONV = ['转化率排名', 'conversion_rate_ranking']
 COL_END_DATE = ['结束日期', 'end_date', 'end_time']
 COL_COST_THRUPLAY = ['单次 ThruPlay 费用 (USD)', '单次 ThruPlay 费用', 'cost_per_thruplay']
+# ---- P1b 新增：广告组粒度 + 两个补充信号（2026-10-02）----
+# ① 广告组名称：Ads Manager 可以按「广告组」层级导出，那时文件里**没有**广告名称/系列名称列。
+#    以前这种导出会被结构校验直接拒掉（找不到标识列）—— 现在认它，粒度记为 adset。
+COL_ADSET = ['广告组名称', '广告组名', 'adset_name']
+# ② 视频平均播放时长：注意 Meta 的格式**不统一** ——
+#    零值是 '00:00:00'（时分秒），非零值却是裸秒数（'2' / '4'）。
+#    直接 float() 会崩，直接当秒又会把 '00:01:30' 读成 130 秒。必须按格式分别解析。
+COL_VIDEO_AVG = ['视频平均播放时长', '视频平均播放时间', 'video_avg_time_watched',
+                 'video_avg_time_watched_actions', 'video_play_time']
+# ③ 单次链接点击费用 - 独立用户：与「单次链接点击费用（全部）」成对出现，两者相除得到
+#    「同一个人的重复点击」。这是**别的指标给不了**的信号：有人反复点却不买。
+COL_CPC_UNIQUE = ['单次链接点击费用 - 独立用户 (USD)', '单次链接点击费用 - 独立用户',
+                  'cost_per_unique_link_click']
 
 # 空值哨兵：Ads Manager 用 '-' / '--' / '' 表示「这项没有数据」，
 # 与「真实的 0」是两回事，绝不能混为一谈（排名的 '-' ≠ 排名最差）。
@@ -162,6 +175,35 @@ def _text_or_none(v):
     return s
 
 
+def _secs(v):
+    """把「视频平均播放时长」解析成秒；解析不了返回 None。
+
+    Meta 这一列的格式**不统一**（实测同一份文件里两种并存）：
+      · 零值   → '00:00:00'（时分秒，可能还有 '00:00:00.123'）
+      · 非零值 → 裸秒数，如 '2' / '4'（不是 '00:00:02'）
+    所以不能一句 float() 了事：'00:01:30' 会被读成 130 秒（真值是 90 秒），
+    '2' 又会被当成非法时分秒丢掉。格式各判各的。
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in _EMPTY_TOKENS:
+        return None
+    if ':' in s:                       # 时分秒
+        parts = s.split(':')
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            return None
+        while len(nums) < 3:           # '1:30' → 1分30秒
+            nums.insert(0, 0.0)
+        return nums[0] * 3600.0 + nums[1] * 60.0 + nums[2]
+    try:
+        return float(s)                # 裸秒数
+    except ValueError:
+        return None
+
+
 def _infer_objective(metric):
     """从『成效指标』反推目标（形如 actions:offsite_conversion.fb_pixel_purchase）。"""
     m = _norm(metric)
@@ -220,15 +262,23 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
     if not (probe.has(COL_SPEND) or probe.has(COL_IMP)):
         raise LoadError("找不到花费/展示列（需要『已花费金额 (USD)』或『展示次数』）。\n"
                         "当前表头：%s" % '、'.join(list(probe.keys())[:12]))
-    if not (probe.has(COL_AD) or probe.has(COL_CAMP) or probe.has(COL_AD_ID)):
-        raise LoadError("找不到广告/系列标识列（需要『广告名称』或『广告系列名称』）。")
+    if not (probe.has(COL_AD) or probe.has(COL_CAMP) or probe.has(COL_AD_ID) or probe.has(COL_ADSET)):
+        raise LoadError("找不到广告/广告组/系列标识列（需要『广告名称』『广告组名称』或『广告系列名称』）。\n"
+                        "当前表头：%s" % '、'.join(list(probe.keys())[:12]))
 
-    # ---- 粒度：有广告列就按广告聚合（更细），否则退到系列 ----
+    # ---- 粒度：有广告列就按广告聚合（最细）；否则退到广告组；再退到系列 ----
+    # 为什么要有中间那一档：Ads Manager 可以按「广告组」层级导出，那种文件里
+    # **没有广告名称也没有系列名称**，以前会被直接拒掉（找不到标识列）。
+    # 但广告组的名字恰恰是最该拿来做判断的粒度 —— Meta 的投放洞察、学习期、
+    # 预算都在这一层，不该因为「没有更细的列」就整份读不了。
     grain = 'ad'
     if probe.has(COL_AD):
         key_fn = lambda r: (r.pick(COL_AD_ID) or '', r.pick(COL_AD) or '', r.pick(COL_CAMP) or '')
     elif probe.has(COL_AD_ID):
         key_fn = lambda r: (r.pick(COL_AD_ID) or '', '', r.pick(COL_CAMP) or '')
+    elif probe.has(COL_ADSET):
+        grain = 'adset'
+        key_fn = lambda r: ('', r.pick(COL_ADSET) or '', r.pick(COL_CAMP) or '')
     else:
         grain = 'campaign'
         key_fn = lambda r: ('', '', r.pick(COL_CAMP) or '')
@@ -263,6 +313,9 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
         gaps.add('覆盖人数（reach）：本文件无此列 → frequency 无法计算，按 0 走。')
     if grain == 'campaign':
         gaps.add('本文件只有系列列、没有广告列 → 按**系列**粒度聚合（AI 会把整个系列当一个投放对象看）。')
+    if grain == 'adset':
+        gaps.add('本文件是**广告组**粒度导出 → 每条 = 一个广告组（不是单个广告）。'
+                 '广告组里可能挂着多条广告，组内表现是它们加总的结果。')
 
     for (ad_id, ad_name, camp_name), days in groups.items():
         days_sorted = sorted(days, key=lambda r: str(r.pick(COL_DATE))[:10])
@@ -283,6 +336,13 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
         rank_conv = None
         end_date = None
         cost_thruplay = None
+        # P1b：补充信号（窗口级汇总，由逐日值加权得出，见下）
+        vsec_sum = 0.0        # Σ(日均观看秒数 × 当日花费)
+        vsec_w = 0.0          # Σ(当日花费) —— 只统计真花了钱的天
+        vsec_days = 0         # 支撑天数：这个均值是几天算出来的（要跟 AI 说实话）
+        rc_sum = 0.0          # Σ(重复点击率 × 当日花费)
+        rc_w = 0.0            # Σ(当日花费)
+        rc_days = 0           # 重复点击率基于几天
         first_date = str(days_sorted[0].pick(COL_DATE))[:10]
 
         for d in days_sorted:
@@ -323,6 +383,34 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
                 end_date = _text_or_none(d.pick(COL_END_DATE))
             if cost_thruplay is None and d.pick(COL_COST_THRUPLAY) not in (None, ''):
                 cost_thruplay = _num(d.pick(COL_COST_THRUPLAY), float, None)
+            # P1b：视频平均播放时长 —— 按「当日花费」加权平均，只在花了钱的天计入。
+            # 为什么不取简单平均、也不取第一天：Ads Manager 在零投放的天写 '00:00:00'，
+            # 简单平均会被一堆零白天拉到接近 0（实测 118 行里 116 行是零），
+            # 得到的「平均 0.07 秒」是假的 —— 真实值只由真正播过的天决定。
+            vsec = _secs(d.pick(COL_VIDEO_AVG))
+            if vsec and vsec > 0 and spend > 0:
+                vsec_sum += vsec * spend
+                vsec_w += spend
+                vsec_days += 1
+            # 单次链接点击费用（独立用户）：必须和**当天的**点击量配对算，
+            # 绝不能拿整窗口 CPC 去除单日的独立用户 CPC —— 分子分母不同窗口 = 假比值
+            # （踩过的坑：混算得到 0.0028，真值 0.0317，差 11 倍）。
+            cpc_uniq_day = _num(d.pick(COL_CPC_UNIQUE), float, None)
+            if cpc_uniq_day and cpc_uniq_day > 0 and clicks > 0 and spend > 0:
+                uniq_clicks_day = spend / cpc_uniq_day
+                # 独立点击数在语义上必然是整数。但 CSV 里的费用被四舍五入到 6 位小数，
+                # 相除会带出 11.00002 这种尾差 —— 实测 10.16/0.923636 就是这样，
+                # 于是 1-11.00002/11 得到 -0.0000018，被「必须 ≥0」的守卫整条丢掉，
+                # 而真值是 0（11 次点击来自 11 个人，完全不重复）。
+                # 所以在容差内先取整，再判断，避免把「完全不重复」误判成异常而丢失信号。
+                _uniq_i = round(uniq_clicks_day)
+                if abs(uniq_clicks_day - _uniq_i) <= 0.02:
+                    uniq_clicks_day = float(_uniq_i)
+                # 独立用户点击必须 ≤ 全部点击；否则是平台口径不一致，宁可不报
+                if 0 < uniq_clicks_day <= clicks:
+                    rc_sum += (1.0 - (uniq_clicks_day / clicks)) * spend
+                    rc_w += spend
+                    rc_days += 1
 
             tot['spend'] += spend
             tot['imp'] += imp
@@ -427,6 +515,16 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
             rec['end_date'] = end_date
         if cost_thruplay is not None:
             rec['cost_per_thruplay'] = cost_thruplay
+        # ---- P1b：补充信号（2026-10-02）----
+        # 两个都是「别的指标推不出来」的：观众到底看了几秒、有没有人反复点却不买。
+        # 一律带支撑天数（watch_days / rc_days），因为实测这两列在零投放的天是空的，
+        # 均值可能只由 1 天算出 —— 不写天数，AI 会把「1 天的均值」当成整窗口均值。
+        if vsec_w > 0:
+            rec['video_avg_watch_sec'] = round(vsec_sum / vsec_w, 1)
+            rec['video_watch_days'] = vsec_days
+        if rc_w > 0:
+            rec['repeat_click_ratio'] = round(rc_sum / rc_w, 4)
+            rec['repeat_click_days'] = rc_days
         out.append(rec)
 
     statuses = {}
@@ -459,6 +557,26 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
     if not probe.has(COL_ATTR):
         gaps.add('归因设置：本文件没有这一列 → 归因窗口未知，'
                  '跨来源的 ROAS / 购买数不可直接比大小。')
+
+    # P1b 缺口声明：同样区分「没这列」和「有列但没值」
+    has_vcol = probe.has(COL_VIDEO_AVG)
+    n_no_v = sum(1 for r in out if 'video_avg_watch_sec' not in r)
+    if has_vcol and n_no_v:
+        gaps.add('视频平均播放时长：导出里有这一列，但 %d/%d 条的值为 0（= 当天没有视频播放）。'
+                 '留存/观看时长信号只覆盖真正播过的天，别当整窗口都在这个水平。'
+                 % (n_no_v, len(out)))
+    elif not has_vcol:
+        gaps.add('视频平均播放时长：本文件没有这一列 → 无法判断「观众到底看了几秒」，'
+                 '不得用 3 秒播放数去推断观看深度。')
+    has_ucol = probe.has(COL_CPC_UNIQUE)
+    if has_ucol:
+        n_rc = sum(1 for r in out if 'repeat_click_ratio' in r)
+        if not n_rc:
+            gaps.add('独立用户点击费用：导出里有这一列，但没有一行能和当天的点击量配成对 → '
+                     '重复点击率算不出来（不拿跨窗口的数字硬凑）。')
+    else:
+        gaps.add('独立用户点击费用：本文件没有这一列 → 无法区分「很多人在点」和'
+                 '「少数人反复点」，后者通常是素材没讲清或落地页没接住。')
 
     meta = {
         'file': os.path.basename(path),

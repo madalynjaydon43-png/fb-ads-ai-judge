@@ -326,6 +326,18 @@ def make_snapshot(campaigns_insights):
             row['end_date'] = c.get('end_date')
         if c.get('cost_per_thruplay') is not None:
             row['cost_per_thruplay'] = c.get('cost_per_thruplay')
+        # ---- P1b：补充信号（2026-10-02）----
+        #   video_avg_watch_sec 观众平均看了几秒 → 3 秒播放数高但时长很短 = 只是被前 3 秒钩住
+        #   repeat_click_ratio  非独立点击数占比 → 高 = **少数人反复点却不买**，
+        #                       问题在落地页/信任，不在素材曝光；这与「很多人感兴趣」是两回事
+        # 两者都带支撑天数（video_watch_days / repeat_click_days）：实测这两列只在真投放的
+        # 天有值，均值可能只由 1 天算出，不写天数等于让模型把 1 天当整窗口。
+        if c.get('video_avg_watch_sec') is not None:
+            row['video_avg_watch_sec'] = c.get('video_avg_watch_sec')
+            row['video_watch_days'] = c.get('video_watch_days')
+        if c.get('repeat_click_ratio') is not None:
+            row['repeat_click_ratio'] = c.get('repeat_click_ratio')
+            row['repeat_click_days'] = c.get('repeat_click_days')
         rows.append(row)
     return rows
 
@@ -379,6 +391,7 @@ def build_prompt(snapshot, config, window=None):
         f"你是资深 Facebook 广告投放优化师。**今天是 {today_str}**。下面是 {n} 条广告的数据快照：每条含汇总指标"
         "（spend / roas / 漏斗各环节 / ctr / cpm / frequency / 预算类型等）、**程序算好的样本量 sample**、"
         "**口径与对照字段（status 投放状态 / attribution 归因窗口 / optimization_event 优化目标 / rankings 竞争排名）**、"
+        "**补充信号（video_avg_watch_sec 平均观看秒数 / repeat_click_ratio 重复点击占比）**、"
         "与**逐日明细 daily_spend**。\n"
         "【数据口径 —— 必须先读懂再判断】\n"
         f"  · 时间窗：**{window_start} ~ {today_str}**（最近 {lookback_days} 天）。每条广告顶层的 "
@@ -405,6 +418,17 @@ def build_prompt(snapshot, config, window=None):
         "  · **rankings（quality 质量 / engagement 互动率 / conversion 转化率）= 和抢同批受众的广告比出来的排名**，"
         "是唯一的外部对照：自身 CTR 3% 说明不了好坏，要看排名档位。"
         "**rankings 缺失或为空 = Meta 没给这项数据（通常因为投放量不够），绝不等于「排名差」，不得据此下结论。**\n"
+        "  · **video_avg_watch_sec = 观众平均看了几秒**（附 video_watch_days = 这个均值由几天算出）。"
+        "用它区分「被开头钩住」和「真的看进去了」：3 秒播放数好看但平均只有 1~2 秒，"
+        "说明素材只赢在开头、后半段留不住人 —— **这属于素材问题，不是出价/预算问题，"
+        "不得因此给 decrease_budget，该给的是「换素材」的判断。**"
+        "天数很少（如只有 1 天）时，这个均值只能当**单日观察**，不许说成「整窗口的平均观看时长」。"
+        "（字段不存在 = 没有视频观看数据，不得用 3 秒播放数反推观看深度。）\n"
+        "  · **repeat_click_ratio = 非独立点击数占全部点击的比例**（同一个人被重复计数）。"
+        "高（>0.3）说明**少数人在反复点**，而不是「很多人感兴趣」—— 这类广告 CTR 往往好看但不下单，"
+        "问题在落地页 / 价格 / 信任，**不在素材曝光**。"
+        "**它是「往下一环排查」的信号，不是独立的关停理由**：不得仅凭它就给 pause / decrease_budget，"
+        "必须结合 net_view.net 的正负再定。\n"
         + note_text +
         f"【硬性要求】必须对输入中的**每一条**广告都输出一条结论，共 **{n} 条**，一条不能少、不能合并、不能跳过。\n"
         "  表现正常、不需要动作的也必须输出，action 填 \"observe\"。宁可全给 observe，也绝不能漏掉任何一条 ——"

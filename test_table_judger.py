@@ -908,5 +908,181 @@ class TestP0P1Columns(unittest.TestCase):
                         '真实导出里归因设置应当每一行都能读到')
 
 
+class TestP1bSignals(unittest.TestCase):
+    """P1b：广告组粒度 + 视频平均播放时长 + 重复点击率。
+
+    这批和 P0/P1 不是一类东西：P0/P1 是「决定别的数字怎么读」的前提，
+    P1b 是**两个从任何现有指标都推不出来的观测**：
+
+      · video_avg_watch_sec —— 观众平均看了几秒。3 秒播放数高但时长只有 1~2 秒，
+        说明素材只赢在开头；这个判断用 CTR/ROAS 怎么算都算不出来。
+      · repeat_click_ratio —— 非独立点击数占全部点击的比例。高 = 少数人反复点
+        （落地页/价格/信任问题），低 = 很多人在点（素材/受众问题）。同样推不出来。
+
+    真实触发这两个 bug 的那份导出有两个陷阱，都写进用例里了：
+      ① 时长列格式混用：零值写 '00:00:00'，非零值写裸秒数 '2'；
+      ② 费用四舍五入到 6 位小数 → 11.37/0.5685 = 20.0004，除完带尾差，
+         直接算 1-x 会得到负数并把「完全不重复」整条丢掉。
+    """
+
+    HDR = ['报告开始日期', '广告组名称', '广告组投放', '已花费金额 (USD)', '展示次数',
+           '覆盖人数', '链接点击量', '购物次数', '购物转化价值', '广告组预算',
+           '广告组预算类型', '视频平均播放时长', '单次链接点击费用 - 独立用户 (USD)']
+
+    def _write(self, rows, header=None):
+        fd, path = tempfile.mkstemp(suffix='.csv')
+        os.close(fd)
+        with io.open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(header or self.HDR)
+            w.writerows(rows)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def _row(self, over=None):
+        """造一行数据。over 用 dict 传 —— 列名带空格和括号，不能当关键字参数名。"""
+        r = {'报告开始日期': '2026-03-10', '广告组名称': '组A', '广告组投放': 'not_delivering',
+             '已花费金额 (USD)': '11.37', '展示次数': '318', '覆盖人数': '294',
+             '链接点击量': '22', '购物次数': '1', '购物转化价值': '63.95',
+             '广告组预算': '20', '广告组预算类型': '单日预算',
+             '视频平均播放时长': '4', '单次链接点击费用 - 独立用户 (USD)': '0.5685'}
+        r.update(over or {})
+        return [r[k] for k in self.HDR]
+
+    # ---------- 时长解析 ----------
+    def test_secs_parses_both_formats_meta_uses(self):
+        self.assertEqual(lo._secs('4'), 4.0)            # 裸秒数（非零值的真实格式）
+        self.assertEqual(lo._secs('00:00:00'), 0.0)     # 零值的真实格式
+        self.assertEqual(lo._secs('00:01:30'), 90.0)
+        self.assertEqual(lo._secs('1:30'), 90.0)        # 缺小时位
+        self.assertEqual(lo._secs('00:00:02.5'), 2.5)
+
+    def test_secs_does_not_read_colon_as_decimal(self):
+        """反向断言：'00:01:30' 是 90 秒，绝不能被读成 130（把冒号当小数点）。"""
+        self.assertNotEqual(lo._secs('00:01:30'), 130.0)
+
+    def test_secs_empty_sentinels_are_none(self):
+        for v in ('', '-', '--', 'n/a', None):
+            self.assertIsNone(lo._secs(v), '输入 %r 应当读成 None' % (v,))
+
+    # ---------- 广告组粒度 ----------
+    def test_adset_grain_is_accepted(self):
+        """以前按「广告组」层级导出的文件会被结构校验直接拒掉（找不到标识列）。"""
+        rows, meta = lo.load_file(self._write([self._row()]))
+        self.assertEqual(meta.get('grain'), 'adset')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['name'], '组A')
+
+    def test_adset_level_status_column_is_read(self):
+        """广告组层级导出里状态列叫「广告组投放」。
+
+        以前别名表里没有它 → status 落进 (None or 'ACTIVE') → 一条**没在投**的广告
+        被报成 ACTIVE，而 prompt 明写「status 非 ACTIVE 不得加预算」——
+        这等于把最该拦住的那条规则给绕过去了。
+        """
+        rows, _ = lo.load_file(self._write([self._row({'广告组投放': 'not_delivering'})]))
+        self.assertEqual(rows[0]['status'], 'NOT_DELIVERING')
+
+    def test_campaign_grain_not_stolen_by_adset_branch(self):
+        """只有系列名的老文件必须仍然走 campaign 粒度（判断顺序回归）。"""
+        hdr = ['报告开始日期', '广告系列名称', '已花费金额 (USD)', '展示次数', '覆盖人数',
+               '链接点击量', '购物次数', '购物转化价值']
+        vals = {'报告开始日期': '2026-03-10', '广告系列名称': '系列A',
+                '已花费金额 (USD)': '20', '展示次数': '1000', '覆盖人数': '800',
+                '链接点击量': '30', '购物次数': '2', '购物转化价值': '60'}
+        rows, meta = lo.load_file(self._write([[vals[c] for c in hdr]], header=hdr))
+        self.assertEqual(meta.get('grain'), 'campaign')
+        self.assertEqual(rows[0]['name'], '系列A')
+
+    # ---------- 重复点击率 ----------
+    def test_repeat_click_ratio_computed(self):
+        """11.37 花费 / 22 次点击 / 独立点击单价 0.5685 → 独立用户 20 → 重复率 1-20/22。"""
+        rows, _ = lo.load_file(self._write([self._row()]))
+        self.assertAlmostEqual(rows[0]['repeat_click_ratio'], 0.0909, places=3)
+
+    def test_repeat_click_ratio_zero_survives_rounding(self):
+        """11 次点击来自 11 个人 → 重复率 0。
+
+        11.37/0.923636 = 11.00002（CSV 费用保留 6 位小数的尾差），
+        不做容差取整就会得到 -0.0000018，被守卫整条丢掉 —— 真实值明明是 0。
+        """
+        rows, _ = lo.load_file(self._write([self._row({
+            '已花费金额 (USD)': '10.16', '链接点击量': '11',
+            '单次链接点击费用 - 独立用户 (USD)': '0.923636'})]))
+        self.assertEqual(rows[0].get('repeat_click_ratio'), 0.0)
+        self.assertEqual(rows[0].get('repeat_click_days'), 1)
+
+    def test_repeat_click_ratio_absent_when_column_missing(self):
+        """没有这一列 → 字段整个不出现，绝不能填 0 冒充「观测到的零」。"""
+        hdr = [c for c in self.HDR if c != '单次链接点击费用 - 独立用户 (USD)']
+        vals = dict(zip(self.HDR, self._row()))
+        rows, meta = lo.load_file(self._write([[vals.get(c, '') for c in hdr]], header=hdr))
+        self.assertNotIn('repeat_click_ratio', rows[0])
+        self.assertTrue(any('独立用户点击费用' in g for g in (meta.get('data_gaps') or [])),
+                        '缺列必须在 data_gaps 里明说')
+
+    def test_repeat_click_ratio_not_computed_across_windows(self):
+        """分子分母必须同一天。跨窗口硬凑 = 之前踩过的 11 倍误差。"""
+        rows, _ = lo.load_file(self._write([
+            self._row({'报告开始日期': '2026-03-10', '已花费金额 (USD)': '20',
+                       '链接点击量': '10', '单次链接点击费用 - 独立用户 (USD)': '1.0'}),
+            self._row({'报告开始日期': '2026-03-11', '已花费金额 (USD)': '0',
+                       '链接点击量': '0', '单次链接点击费用 - 独立用户 (USD)': '0.5'}),
+        ]))
+        # 第 1 天独立点击 20 > 全部点击 10 → 口径不自洽 → 两天都不该计入
+        self.assertNotIn('repeat_click_ratio', rows[0])
+
+    # ---------- 观看时长 ----------
+    def test_watch_seconds_ignore_zero_spend_days(self):
+        """零投放的天写 '00:00:00'，计进去会把均值稀释成假的「平均 0.07 秒」。"""
+        rows, _ = lo.load_file(self._write([
+            self._row({'报告开始日期': '2026-03-10', '视频平均播放时长': '4'}),
+            self._row({'报告开始日期': '2026-03-11', '已花费金额 (USD)': '0',
+                       '展示次数': '0', '覆盖人数': '0', '链接点击量': '0',
+                       '购物次数': '0', '购物转化价值': '0',
+                       '视频平均播放时长': '00:00:00'}),
+        ]))
+        self.assertEqual(rows[0]['video_avg_watch_sec'], 4.0)
+        self.assertEqual(rows[0]['video_watch_days'], 1,
+                         '支撑天数必须是 1（只有 03-10 真投放），不是 2')
+
+    def test_watch_fields_absent_when_all_zero(self):
+        hdr = [c for c in self.HDR if c != '视频平均播放时长']
+        vals = dict(zip(self.HDR, self._row()))
+        rows, _ = lo.load_file(self._write([[vals.get(c, '') for c in hdr]], header=hdr))
+        self.assertNotIn('video_avg_watch_sec', rows[0])
+
+    # ---------- prompt ----------
+    def test_prompt_declares_how_to_read_new_signals(self):
+        rows, _ = lo.load_file(self._write([self._row()]))
+        p = eng.build_prompt(rows, {}, window=None)
+        for needle in ('video_avg_watch_sec', 'video_watch_days',
+                       'repeat_click_ratio', 'repeat_click_days'):
+            self.assertIn(needle, p)
+        # 两条「不许拿它当关停理由」的边界必须写进 prompt，否则会被挪用到别的动作上
+        self.assertIn('不得因此给 decrease_budget', p)
+        self.assertIn('不是独立的关停理由', p)
+
+    # ---------- 真实数据 ----------
+    def test_real_adset_export(self):
+        """本机若有那份广告组级导出，跑一遍真实数据。"""
+        import glob
+        dl = os.environ.get('FB_EXPORT_DIR', os.path.expanduser(os.path.join('~', 'Downloads')))
+        cand = [p for p in sorted(glob.glob(os.path.join(dl, 'voglyn*')))
+                if '(7)' in os.path.basename(p) and p.lower().endswith('.csv')]
+        if not cand:
+            self.skipTest('本机没有那份广告组级导出')
+        rows, meta = lo.load_file(cand[0])
+        self.assertEqual(meta.get('grain'), 'adset')
+        self.assertTrue(all(r['status'] == 'NOT_DELIVERING' for r in rows),
+                        '真实导出里广告全是 not_delivering（没在投）')
+        # 真实文件里只有 2026-03-10 一天有花费 → 支撑天数必须是 1，不能是 59
+        for r in rows:
+            if 'video_watch_days' in r:
+                self.assertLessEqual(r['video_watch_days'], 2)
+            if 'repeat_click_days' in r:
+                self.assertLessEqual(r['repeat_click_days'], 2)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

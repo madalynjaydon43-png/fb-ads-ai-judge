@@ -236,13 +236,30 @@ def cmd_check(args):
             '互动率排名': '竞争排名 —— 同上',
             '转化率排名': '竞争排名 —— 同上',
             '广告投放': '投放状态 —— 非「投放中」不给花钱动作',
+            '广告组投放': '投放状态（广告组层级导出）—— 同上',
+            '广告系列投放': '投放状态（广告系列层级导出）—— 同上',
+            '结束日期': '排期 —— 已结束的投放不再给加预算',
+            '视频平均播放时长': '观看深度 —— 3 秒播放高但时长极短 = 只被开头钩住（换素材，不是调预算）',
+            '单次链接点击费用 - 独立用户': '重复点击 —— 独立用户比全部用户便宜 = 少数人反复点（查落地页，不是查曝光）',
+            '单次 ThruPlay 费用': '视频成本 —— 看完的边际成本',
         }
-        hit = {k: v for k, v in CALIBER_COLS.items()
-               if any(k in str(h) for h in unknown)}
+        # ⚠️ 必须「每个表头只归到**最长**匹配的那一项」：
+        #   '广告投放' 是 '广告组投放' 的子串，'单次链接点击费用' 是
+        #   '单次链接点击费用 - 独立用户 (USD)' 的子串。按 dict 顺序逐个判会重复命中，
+        #   同一列被解释两遍 —— 看着像两份证据，其实是一份。
+        hit = {}
+        for h in unknown:
+            hs = str(h)
+            best = None
+            for k in CALIBER_COLS:
+                if k in hs and (best is None or len(k) > len(best)):
+                    best = k
+            if best and best not in hit:
+                hit[best] = CALIBER_COLS[best]
         if hit:
             print('  其中这几列**不进 30 维特征、但会写进 AI 的口径声明**（不是白导）：')
             for k, v in hit.items():
-                print('    · %-8s %s' % (k, v))
+                print('    · %-22s %s' % (k, v))
             print('  （30 维特征是不变式，改动会作废历史打分，所以口径类字段走 prompt 而不进模型。）')
     print()
     if not miss:

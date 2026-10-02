@@ -365,7 +365,12 @@ def extract_features(rows=None, snapshot=None):
 
 
 GROUP_ALIASES = ['广告系列名称', '系列名称', '系列', 'campaign_name',
-                 '广告名称', '广告名', 'ad_name']
+                 '广告名称', '广告名', 'ad_name',
+                 # 「广告组」放最后，只在前两档都没有时才用。
+                 # Ads Manager 可以按广告组层级导出，那份文件里既没有系列名也没有广告名 ——
+                 # 以前会被判成「找不到分组列」直接报错，整份读不了。
+                 # 放在末尾是为了**不改变**已有文件的分组粒度：同时有广告名和广告组名时仍取广告名。
+                 '广告组名称', '广告组名', 'adset_name']
 ID_ALIASES = ['广告系列 ID', '广告系列id', '广告 ID', '广告id', '广告ID',
               'campaign_id', 'ad_id', 'id']
 
@@ -382,7 +387,7 @@ def resolve_col(header, aliases):
 
 
 def resolve_group_col(header):
-    """找分组列：优先广告系列，退而求其次用广告名。都没有返回 None。"""
+    """找分组列：优先广告系列，其次广告名，都没有才用广告组名。都没有返回 None。"""
     return resolve_col(header, GROUP_ALIASES)
 
 
