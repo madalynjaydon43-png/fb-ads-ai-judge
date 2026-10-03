@@ -234,7 +234,10 @@ class TestGuardrailOverride(unittest.TestCase):
     """护栏必须能覆盖模型输出（这是整个分工的底线）。"""
 
     def test_net_le_zero_forced_pause(self):
-        snap = mk_snapshot('1', net=-7.5, spend=20.0, rev=12.5)
+        # ⚠️ 夹具必须给 fill=1.0 / freq=3.2：默认的 fill=0.5、freq=1.2 是**探索期形态**
+        #    （预算没花出去、受众还没看腻），新规则会正当性地不拦 —— 那时测的就不是
+        #    「护栏能否覆盖模型」而是「探索期是否被识别」了，两件事要分开测。
+        snap = mk_snapshot('1', net=-7.5, spend=20.0, rev=12.5, fill=1.0, freq=3.2)
         sugg = [{'campaign_id': '1', 'action': 'increase_budget',
                  'budget_change_pct': 20, 'reason': '模型想加预算'}]
         out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
@@ -243,6 +246,18 @@ class TestGuardrailOverride(unittest.TestCase):
         self.assertEqual(out[0]['ai_action'], 'increase_budget')   # 原判留痕
         self.assertEqual(out[0]['budget_change_pct'], 0)
         self.assertEqual(stats['forced_pause'], 1)
+
+    def test_exploration_phase_ad_is_not_force_paused(self):
+        """探索期（顶格率低 + 频次低）：护栏不越权，落到 observe 而不是 forced_pause。"""
+        snap = mk_snapshot('9', net=-7.5, spend=20.0, rev=12.5, fill=0.5, freq=1.2)
+        sugg = [{'campaign_id': '9', 'action': 'increase_budget',
+                 'budget_change_pct': 20, 'reason': '模型想加预算'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(out[0]['action'], 'observe')
+        self.assertEqual(out[0]['guardrail'], 'blocked_by_precondition')
+        self.assertEqual(stats['forced_pause'], 0)
+        self.assertEqual(stats['blocked_by_precondition'], 1)
+        self.assertIn('探索期', out[0]['reason'])
 
     def test_net_positive_blocks_kill(self):
         snap = mk_snapshot('2', net=9.9, spend=10.0, rev=19.9)
@@ -1101,6 +1116,22 @@ class TestP1bSignals(unittest.TestCase):
         self.assertIn('落地页、价格、信任这一环查过了吗', p)
         self.assertIn('净额为负不构成关停理由', p)
 
+    def test_signal_flags_switch(self):
+        """信号旗开关：只影响「点名那一段」，不动无条件禁令。
+
+        2026-10-03 新增。条件 B 实测（同数据、同快照，仅关旗）：
+        两轮仍 8/8、T-05/T-06 翻正 2/2 ⇒ 旗是冗余保险，不是主力。
+        所以关旗后的 prompt 必须**仍含**禁令原文，否则这个开关就成了后门。
+        """
+        snap = [{'id': 'x', 'name': 'x', 'repeat_click_ratio': 0.45}]
+        win = ('2026-04-01', '2026-04-05')
+        on = eng.build_prompt(snap, {}, window=win)
+        off = eng.build_prompt(snap, {'enable_signal_flags': False}, window=win)
+        self.assertIn('有强信号', on)              # 默认开
+        self.assertNotIn('有强信号', off)          # config 关得掉
+        for needle in ('净额为负不构成关停理由', '必须先回答一个问题'):
+            self.assertIn(needle, off)             # 禁令仍在：开关只是少一段点名
+
     # ---------- 真实数据 ----------
     def test_real_adset_export(self):
         """本机若有那份广告组级导出，跑一遍真实数据。"""
@@ -1164,11 +1195,51 @@ class TestStopPrecondition(unittest.TestCase):
         self.assertTrue(b)
         self.assertIn('不是 purchase', why)
 
-    def test_blocks_when_clicks_below_sample_floor(self):
-        """实测踩过：门槛原先取 30，50 次点击没拦住 ⇒ 误杀反而涨了。"""
-        b, why = self._hit(clicks=50, spend=50.0)
-        self.assertTrue(b)
-        self.assertIn('样本不足', why)
+    def test_low_clicks_alone_never_blocks_stoploss(self):
+        """🔴 2026-10-03 用户纠正：「没单就是没单，点击再多也得关」。
+
+        原来的 `STOP_MIN_CLICKS = 100`（「点击少 ⇒ 零单是样本不足 ⇒ 不止损」）是错的：
+        它把**统计判断**（「这个样本量下 0 单不算反常」）当成了**不花钱的理由**。
+        天天满额投放、净亏、零单的广告，钱在持续流出 ⇒ **必须照关**，哪怕只点了 30 次。
+        """
+        r, nv = self._row(clicks=30, spend=120.0)
+        blocked, why = eng._stop_precondition(r, nv, {})
+        self.assertFalse(blocked, '满额投放 + 净亏 + 零单，点击再少也要关；却被拦：%s' % why)
+
+    def test_extremely_low_clicks_still_force_paused(self):
+        """端到端：点击 8 次的满额广告，护栏照样 forced_pause（老门槛会放过它）。"""
+        snap = mk_snapshot('1', net=-25.0, spend=25.0, rev=0.0, fill=1.0, freq=3.0, days=5)
+        snap['clicks'] = 8
+        sugg = [{'campaign_id': '1', 'action': 'increase_budget',
+                 'budget_change_pct': 20, 'reason': '模型想加预算'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(out[0]['action'], 'pause', out[0].get('reason'))
+        self.assertEqual(out[0]['guardrail'], 'forced_pause')
+        self.assertEqual(stats['forced_pause'], 1)
+
+    def test_blocks_only_when_underspend_AND_low_freq(self):
+        """真正该给 observe 的形态是**探索期**：预算没花出去 **且** 受众还没看腻。"""
+        r, nv = self._row(clicks=171, spend=67.0)
+        nv['fill_rate'] = 0.05
+        nv['freq_last'] = 1.69
+        blocked, why = eng._stop_precondition(r, nv, {})
+        self.assertTrue(blocked)
+        self.assertIn('探索期', why)
+
+    def test_underspend_alone_is_not_enough_to_block(self):
+        """顶格率低但频次已经上来了 = 探索期结束，只是花钱效率差 ⇒ 照关。"""
+        r, nv = self._row(clicks=800, spend=300.0)
+        nv['fill_rate'] = 0.05
+        nv['freq_last'] = 3.2
+        blocked, why = eng._stop_precondition(r, nv, {})
+        self.assertFalse(blocked, '频次已过 2.5，探索期结束，不该拦：%s' % why)
+
+    def test_clicks_floor_constant_is_gone(self):
+        """钉住删除：不能让人后来又把 clicks 门槛加回来当防误杀。"""
+        self.assertFalse(hasattr(eng, 'STOP_MIN_CLICKS'),
+                         'STOP_MIN_CLICKS 已删除 —— 点击数不是止损判据')
+        self.assertTrue(hasattr(eng, 'STOP_MIN_SPEND_RATE'))
+        self.assertTrue(hasattr(eng, 'STOP_EXPLORE_FREQ_MAX'))
 
     def test_loss_size_gate_is_deliberately_disabled(self):
         """否决记录钉成用例：**不能**让人后来又把它加回来。
@@ -1297,6 +1368,23 @@ class TestLossAttributionPrompt(unittest.TestCase):
         self.assertIn('判「亏在哪」', p)
         self.assertIn('买不到有效流量', p)
         self.assertIn('流量买到了但接不住', p)
+
+    def test_prompt_says_low_clicks_is_not_a_stay_open_reason(self):
+        """🔴 2026-10-03 用户纠正后重写。
+
+        prompt 原来写「几天零单本身不是关停依据，点击量不够时零单会自然发生」——
+        这句话会被读成「点击少 ⇒ 不关」，直接制造漏放（大样本实测漏放 50%）。
+        现在必须写清：判据是**有没有在正常花钱**（顶格率 + 频次），不是点击数；
+        并且明确「满额投放 + 净亏 + 零单 ⇒ 该关，哪怕只点了 30 次」。
+        """
+        p = eng.build_prompt([self._snap()], {}, window=('2026-04-01', '2026-04-05'))
+        self.assertIn('零单就是零单', p)
+        self.assertIn('有没有在正常花钱', p)
+        self.assertIn('探索期', p)
+        self.assertIn('该关', p)
+        # 旧措辞不能残留 —— 它是漏放的直接来源
+        self.assertNotIn('几天零单', p)
+        self.assertNotIn('点击量不够时零单会自然发生', p)
 
     def test_flag_section_names_the_high_repeat_click_ad(self):
         """信号埋在字段说明里没用（双盲两轮都没读它）⇒ 命中阈值必须按名字单独点名。"""
