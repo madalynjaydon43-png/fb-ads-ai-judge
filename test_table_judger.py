@@ -1618,5 +1618,101 @@ class TestTargetRoas(unittest.TestCase):
         self.assertIsNone(eng._cpa_of(r['net_view'], {'purchase': 0, 'spend': 540.0}))
         self.assertIsNone(eng._target_cpa({}))
 
+class TestTargetCpa(unittest.TestCase):
+    """第二个业务目标：「我多少钱出一单」（2026-10-03 接线）。
+
+    🔴 起因：`_cpa_of()` 写了、测试也测了，**却没有任何调用点** ——
+    也就是说这个目标只被拼进 prompt 当一句话，根本没进判断。
+    用户要的是「这两个就是我的优化目标」，只当提示词等于没接。
+
+    CPA 与 ROAS 是**两把独立的尺子**：ROAS 是倍数（每 1 块带回多少），
+    CPA 是绝对金额（出一单花多少）。客单价不同，两把尺子会给不同答案
+    ⇒ 规矩是**两条都要过**才配加预算。
+    """
+
+    BUY = 'actions:offsite_conversion.fb_pixel_purchase'
+    CART = 'actions:offsite_conversion.fb_pixel_add_to_cart'
+
+    def _row(self, spend=300.0, rev=1050.0, orders=30, opt=None, **over):
+        """默认造一条**达标**的：ROAS 3.5、CPA $10/单、净额为正、顶格、频次不饱和。"""
+        r = {'id': 'a1', 'name': 'X', 'status': 'ACTIVE',
+             'optimization_event': opt or self.BUY,
+             'spend': spend, 'purchase_value': rev, 'purchase': orders,
+             'clicks': 800, 'cost_per_purchase': spend / max(orders, 1)}
+        r.update(over)
+        r['net_view'] = {'net': round(rev - spend, 2), 'spend': spend, 'revenue': rev,
+                         'roas': round(rev / spend, 2), 'fill_rate': 1.0,
+                         'freq_first': 2.2, 'freq_last': 2.4, 'days': 5}
+        return r
+
+    def _sugg(self, act='observe'):
+        return [{'campaign_id': 'a1', 'action': act, 'budget_change_pct': 0,
+                 'reason': '模型原判'}]
+
+    def test_unset_target_cpa_means_no_gate(self):
+        """没填 ⇒ 资格线不生效（CPA 差几十倍，代码不能替用户猜）。"""
+        r = self._row()
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': None})
+        self.assertIsNone(st.get('blocked_by_target_cpa'),
+                          '未填时不该拦：%s' % out[0].get('reason', ''))
+
+    def test_cpa_over_target_blocks_nomination(self):
+        """单均成本 $54 > 目标 $20 ⇒ 不给加预算（钱是赚了，但每单买得太贵）。"""
+        r = self._row(spend=540.0, rev=1620.0, orders=10)    # ROAS 3.0、CPA 54
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': 20.0})
+        self.assertEqual(st.get('blocked_by_target_cpa'), 1)
+        self.assertEqual(out[0]['nomination']['blocked_by'], 'target_cpa')
+        self.assertIn('不给它加预算', out[0]['reason'])
+
+    def test_cpa_within_target_allows_nomination(self):
+        """CPA $10 ≤ 目标 $20 ⇒ 提名照常发生（**确认没被新线误拦**）。"""
+        r = self._row()
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': 20.0})
+        self.assertNotEqual(st.get('blocked_by_target_cpa'), 1,
+                            '达标却被拦：%s' % out[0].get('reason'))
+        self.assertIn('nomination', out[0])
+
+    def test_two_rulers_are_independent(self):
+        """🔴 两把尺子都要过：ROAS 达标（3.0 ≥ 2.0）但 CPA 超标（54 > 20）⇒ 仍不给加钱。
+
+        这就是「单少而每单很大」的情形 —— 只盯着 ROAS 看它很漂亮，
+        可换成「一单多少钱」就不划算了。两把尺子必须各自独立拦。
+        """
+        r = self._row(spend=540.0, rev=1620.0, orders=10)
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r],
+                                              {'target_roas': 2.0, 'target_cpa': 20.0})
+        self.assertIsNone(st.get('blocked_by_target_roas'), 'ROAS 是达标的，不该由它拦')
+        self.assertEqual(st.get('blocked_by_target_cpa'), 1, '应由 CPA 线拦下')
+
+    def test_zero_orders_is_not_zero_cpa(self):
+        """🔴 花了钱一单没出 ⇒ CPA 是「无限大」，**不是 0**（0 会被读成零成本、超划算）。
+
+        夹具说明：purchase=0 但 purchase_value>0 不是我编的 ——
+        归因窗口不一致时（订单落在窗口外、金额落在窗口内）真实导出就是这样。
+        """
+        r = self._row(spend=540.0, rev=842.0, orders=0, cost_per_purchase=0)
+        self.assertIsNone(eng._cpa_of(r['net_view'], r), '零单时 CPA 必须是 None（≠0）')
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': 20.0})
+        self.assertEqual(st.get('blocked_by_target_cpa'), 1)
+        self.assertIn('一单没出', out[0]['reason'])
+
+    def test_cart_opt_ad_is_exempt_from_cpa_line(self):
+        """加购口径的广告没有「购买单」可言 —— 拿购买 CPA 卡它就是把靶子搞错。"""
+        r = self._row(opt=self.CART, spend=540.0, rev=1620.0, orders=10)
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': 20.0})
+        self.assertIsNone(st.get('blocked_by_target_cpa'),
+                          '加购口径不该被购买 CPA 拦：%s' % out[0].get('reason'))
+
+    def test_prompt_carries_cpa_target(self):
+        """CPA 目标要出现在 prompt 里，且写清楚「没单 ≠ 零成本」。"""
+        snap = {'id': 'a1', 'name': 'X', 'status': 'ACTIVE', 'spend': 100.0,
+                'clicks': 100, 'purchase': 0, 'daily_spend': []}
+        p = eng.build_prompt([snap], {'target_cpa': 80.0},
+                             window=('2026-04-01', '2026-04-05'))
+        self.assertIn('目标 CPA', p)
+        self.assertIn('一单没出', p)      # 「没单 ≠ CPA=0」这句必须在
+        self.assertIn('80.00', p)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

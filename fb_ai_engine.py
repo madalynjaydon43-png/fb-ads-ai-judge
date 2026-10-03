@@ -49,24 +49,31 @@ KILL_STOP_NET = 0.0       # 止损线：可见窗口净额 ≤ 此值 → 强制
                                 #   🔴 已知偏松，等价于「ROAS ≥ 1 就算赚钱」—— 而广告费的真实盈亏线是
                                 #   ROAS = 1/毛利率（40% 毛利 ⇒ 2.5；50% ⇒ 2.0）。见下方 TARGET_ROAS。
 
-# ---------- 目标值（2026-10-03 用户提出：想让工具按「我要求多少」判断，而不是只按「有没有亏」）
-# ⚠️ 这几个值**必须由用户填**，不能由代码猜 —— 猜出来的阈值和当初那个 1.35 拟合值一样，
+# ---------- 业务目标输入（2026-10-03 用户提出：要按「我要求多少」判断，不是只按「有没有亏」）
+# 用户只填两个数，就是他自己的生意目标：
+#   ① target_roas = **我要的 ROI**：花 1 块钱要带回几块。填 3.0 = 投 100 回 300。
+#   ② target_cpa  = **我多少钱出一单**：一单最多花多少。填 80 = 超过 80 块/单就不划算。
+# ⚠️ 这两个值**必须由用户填**，不能由代码猜 —— 猜出来的阈值和当初那个 1.35 拟合值一样，
 #    换生意就失真。所以：config 里没给 ⇒ **该判据不启用**（而不是用默认值悄悄生效）。
-#    UI 上做成可填项；填了才生效，reason 里要写明用的是哪个目标值。
-TARGET_ROAS = None          # 目标 ROAS（广告费至少要带回几倍收入）。**默认 None = 不启用**
+# 🔴 别让用户填「毛利率」再反推（2026-10-03 纠正）：毛利率是他的内部财务口径，
+#    而且 1÷毛利率 只在「单一品类、单一客单价」下才等于盈亏平衡 ROAS。
+#    这里要的是「我的目标」，不是「我的成本结构」——**直接问目标数**。
+TARGET_ROAS = None          # 目标 ROAS（**我要的 ROI**）。**默认 None = 不启用**
                             #   🔴 2026-10-03 修正：原默认 2.0，导致「不填也在生效」——
                             #   文档写「没填不启用」而代码悄悄替你选了一个数，正是本项目
                             #   反复吃亏的那类错（拟合值当业务值）。要启用就显式填。
-                            #   换算参考：1 ÷ 目标毛利率。40% ⇒ 2.5；50% ⇒ 2.0
-                            #   换算：目标 ROAS = 1 / 目标毛利率。40% 毛利 ⇒ 2.5；50% ⇒ 2.0。
-BREAKEVEN_ROAS = None       # 盈亏平衡 ROAS（= 1/毛利率）。**止损线用它**，不给则止损线退回 net<=0
-                            #   🔴 为什么不直接拿 TARGET_ROAS 当止损线：小额血亏会一直烧钱，
-                            #   止损要卡在「盈亏平衡」而不是「是否达到目标」——
-                            #   **止损线 = 不亏（breakeven），加预算资格线 = 够本且够赚（target）。**
-                            #   两条线必须分开，否则要么放过持续失血，要么永远不敢加预算。
-TARGET_CPA = None           # 目标 CPA（愿为一个订单花多少钱）。**默认不启用** ——
-                            #   CPA 是绝对金额、跨品类差几十倍，代码猜不出来。
-                            #   给了之后会进 prompt 与「加预算资格线」，并算 cpa_actual 供对照。
+                            #   （只有毛利率想换算时：ROAS ≈ 1 ÷ 毛利率。但那是成本口径，
+                            #    不是目标口径，别拿它当 target 用。）
+BREAKEVEN_ROAS = None       # 【可选·高级】想让「止损线」比「净额≤0」更严时才填，
+                            #   **直接填 ROAS 数值**（如 1.5），不是填毛利率。
+                            #   不填 ⇒ 止损线就是 net<=0（花的钱没回来 = 亏，会计恒等式，不用配置）。
+                            #   🔴 止损线不能拿 TARGET_ROAS 顶替：小额失血会一直烧钱，
+                            #   止损要卡在「不亏」，而 target 是「够赚」——
+                            #   **止损线 = 不亏，加预算资格线 = 达到我的目标。两条线不同档。**
+TARGET_CPA = None           # 目标 CPA（**我多少钱出一单**）。**默认不启用** ——
+                            #   CPA 是绝对金额、跨品类差几十倍，代码猜不出来，只能用户给。
+                            #   🔴 2026-10-03 接线：原来它只进 prompt（_cpa_of 写了却没人调用 = 死代码），
+                            #   现在真的进「加预算资格线」——超了就不给加钱。
 # ⚠️ 「未提供 ⇒ 不启用」的判断都用 `is None`，**不是 falsy** ——
 #   0 是「我要求 ROAS=0」（= 不设限），None 才是「我没填」。用 `or` 会把 0 当成没填。
 
@@ -457,26 +464,38 @@ def _target_block(config):
     if tr is None and be is None and tc is None:
         return ''
     L = ['【我的目标值（这是硬要求，不是参考）】']
-    if be is not None:
-        L.append('- 盈亏平衡 ROAS = %.2f  ⇒ 低于它就是**卖得越多亏得越多**（= 1/毛利率 %.0f%%）'
-                 % (be, (100.0 / be) if be else 0.0))
-    if tr is not None:
-        L.append('- 目标 ROAS = %.2f  ⇒ 只有达到它才**值得加预算**' % tr)
     if tc is not None:
-        L.append('- 目标 CPA = $%.2f / 单  ⇒ 单均成本高于它就不划算' % tc)
-    L.append('')
-    L.append('  ⚠️ **两档线的区别必须分清（这是最容易搞错的地方）**：')
-    if be is not None:
-        L.append('    · ROAS < %.2f  → **该关**：它在净亏，而且加放量只会亏更多' % be)
-    if be is not None and tr is not None:
-        L.append('    · %.2f ≤ ROAS < %.2f → **不加预算**（广告费回本了，但按我的要求还没达标，'
-                 '加钱只会放大差距）；同时**不该关**，慢慢看' % (be, tr))
+        L.append('- **目标 CPA = $%.2f / 单**：出一单我最多花这么多钱，超过就不划算' % tc)
     if tr is not None:
-        L.append('    · ROAS ≥ %.2f → 才有资格谈加预算（再叠加顶格率、频次条件）' % tr)
+        L.append('- **目标 ROAS = %.2f**：花 1 块要带回 %.2f 块，达不到就不配加预算' % (tr, tr))
+    if be is not None:
+        L.append('- 盈亏平衡 ROAS = %.2f：低于它就是净亏' % be)
+    L.append('')
+    L.append('  ⚠️ **三档线的区别必须分清（这是最容易搞错的地方）**：')
+    if be is not None:
+        L.append('    · ROAS < %.2f  → **该关**：它在净亏，放量只会亏更多' % be)
+    else:
+        L.append('    · 净额 ≤ 0（花的钱没回来）→ **该关**：它在净亏，放量只会亏更多')
+    if tr is not None:
+        L.append('    · 净额 > 0 但 ROAS < %.2f → **不加预算**：钱回本了，'
+                 '但没达到我要的回报，加钱只是把差距放大；**不该关**，继续看' % tr)
+        L.append('    · ROAS ≥ %.2f → 才**有资格**谈加预算（还要叠加顶格率、频次条件）' % tr)
+    if tc is not None:
+        L.append('    · CPA > $%.2f / 单 → **不加预算**：单均成本超了我的上限，'
+                 '放量只是买更多贵单' % tc)
+    if tr is not None and tc is not None:
+        L.append('  ⇒ **两把尺子都要过**：ROAS 是「每一块钱带回多少」（倍数），'
+                 'CPA 是「出一单花多少」（绝对金额）。客单价不同，两把尺子会给出不同答案 —— '
+                 '比如单多但每单很小（ROAS 高、CPA 低）看着都好，'
+                 '而单少但每单很大（ROAS 高、CPA 也高）就会打架。'
+                 '**加预算必须两条同时达标**，只过一条不算。')
+    if tc is not None:
+        L.append('  ⇒ **花了钱却一单没出时，CPA 算不出来（= 单均成本无限大），'
+                 '不是 CPA=0**。别把「没单」读成「零成本」，那种情况按不达标处理。')
     L.append('  ⇒ **「净额为正」不等于「该加预算」**：净额为正只说明广告费回本了，'
-             '能不能赚钱要看 ROAS 有没有达到我的目标值。')
+             '够不够好要看它有没有达到我上面的目标值。')
     L.append('  ⇒ 成效指标不是 purchase 的广告（加购/结账等），**这些线对它不适用**，'
-             '别拿购买 ROAS 去判它跑得好不好。')
+             '别拿购买口径的 ROAS / CPA 去判它跑得好不好。')
     L.append('')
     return chr(10).join(L)
 
@@ -1103,6 +1122,7 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
     idx = _row_index(snapshots)
     stop_net = float(config.get('kill_stop_net', KILL_STOP_NET))
     target_roas = _target_roas(config)
+    target_cpa = _target_cpa(config)
     breakeven = _breakeven_roas(config)
     fill_min = float(config.get('nominate_fill_rate', NOMINATE_FILL_RATE))
     # 🔴 提名线②：默认用**饱和线**（有行业共识），不再用 v5 拟合出来的 1.35。
@@ -1171,10 +1191,10 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
                         % (net, _money, stop_net))
                 if _hit_be:
                     _r = _roas_of(nv)
-                    _why = ('窗口 ROAS %.2f < 盈亏平衡线 %.2f（= 1/毛利率 %.0f%%）：'
+                    _why = ('窗口 ROAS %.2f < 盈亏平衡线 %.2f：'
                             '**广告费虽然回本了，但商品成本吃掉全部收入，卖得越多亏得越多**'
                             '（净额 %+.2f 仍为正，所以「只看不亏」根本抓不到它）'
-                            % (_r, _be, (100.0 / _be) if _be else 0.0, net))
+                            % (_r, _be, net))
                 s['reason'] = ('【护栏·止损】%s → 强制暂停（AI 原判「%s」）。原理由：%s'
                                % (_why, ACTION_CN.get(act, act), s.get('reason', '')))
                 stats['forced_pause'] += 1
@@ -1230,6 +1250,42 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
                 stats['blocked_by_target_roas'] = stats.get('blocked_by_target_roas', 0) + 1
                 continue
 
+        # 🔴 2026-10-03 接线：加预算资格线② —— CPA 不能超过「我多少钱出一单」。
+        #    ROAS 是倍数、CPA 是绝对金额，**两把尺子独立，两条都要过**才配加预算
+        #    （单多而每单小：ROAS 高但 CPA 也高；单少而每单大：ROAS 高、CPA 更高 —— 会打架）。
+        #    ⚠️ _cpa_of 之前写了却没有任何调用点 = 死代码 ⇒ 第二个目标形同没生效。现在接上。
+        if target_cpa is not None:
+            _c = _cpa_of(nv, row)
+            _opt = str(row.get('optimization_event') or '')
+            _orders = _num(row.get('purchase'))
+            _sp = _num(nv.get('spend'))
+            _over = False
+            if (not _opt or 'purchase' in _opt):   # 口径不适用（加购等）不判
+                if _c is not None and _c > target_cpa:
+                    _over = True
+                # 🔴 花了钱一单没出 ⇒ CPA 是「无限大」，**不是 0**（0 会被读成「零成本、超划算」）
+                elif (_c is None and _orders is not None and _orders <= 0
+                      and _sp is not None and _sp > 0):
+                    _over = True
+            if _over:
+                _why_cpa = ('窗口 CPA $%.2f / 单 > 目标 $%.2f / 单' % (_c, target_cpa)
+                            if _c is not None
+                            else '花了钱却一单没出（CPA 算不出来 = 单均成本无限大）')
+                s['nomination'] = {
+                    'blocked_by': 'target_cpa',
+                    'target_cpa': target_cpa,
+                    'cpa': (round(_c, 2) if _c is not None else None),
+                    'note': ('单均成本 %.2f 超过目标 %.2f' % (_c, target_cpa)) if _c is not None
+                            else '零单，CPA 无法计算',
+                }
+                s['reason'] = (s.get('reason', '') +
+                               '【护栏·加预算资格】%s ⇒ **不给它加预算**：'
+                               '我的目标是「一单最多花 $%.2f」，超了就是在买贵单，'
+                               '放量只会买更多（原判「%s」保留，人工可复核）。'
+                               % (_why_cpa, target_cpa, ACTION_CN.get(act, act)))
+                stats['blocked_by_target_cpa'] = stats.get('blocked_by_target_cpa', 0) + 1
+                continue
+
         # 频次增幅：只在首末都拿到时才算，拿不到就不 disqualify（信息缺失 ≠ 不合格）
         growth = None
         if ff is not None and fl is not None:
@@ -1265,7 +1321,6 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         stats['nominated'] += 1
 
     return suggestions, stats
-
 
 # ---------- 学习型判断层接入（2026-10-02）----------
 # 目标：让「从历史结局里学」的表格模型（table_judger.TableJudger）能
