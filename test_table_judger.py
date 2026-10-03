@@ -336,6 +336,19 @@ class TestGuardrailOverride(unittest.TestCase):
         out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
         self.assertEqual(out[0]['guardrail'], 'forced_pause')
 
+    def test_net_positive_decrease_budget_passes_through(self):
+        """减预算不是关停（2026-10-04 验收）：净额为正时禁杀线只禁 pause。
+
+        AD010 形态：净 +48 在赚，但近 3 天 0 单、ROAS 1.06 —— AI 判减预算应原样通过，
+        且减着的钱不再叠加加预算提名（减着钱还提名加钱是自相矛盾）。"""
+        snap = mk_snapshot('10', net=48.0, spend=20.0, rev=68.0, fill=1.0, freq=3.2)
+        sugg = [{'campaign_id': '10', 'action': 'decrease_budget', 'budget_change_pct': 30,
+                 'reason': '近三天零单，先减 30%'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(out[0]['action'], 'decrease_budget')
+        self.assertNotIn('guardrail', out[0])
+        self.assertNotIn('提名', out[0]['reason'])
+
 
 class TestAbstain(unittest.TestCase):
     def test_low_confidence_abstains_to_rule(self):
@@ -1081,6 +1094,16 @@ class TestP1bSignals(unittest.TestCase):
         self.assertNotIn('repeat_click_ratio', rows[0])
         self.assertTrue(any('独立用户点击费用' in g for g in (meta.get('data_gaps') or [])),
                         '缺列必须在 data_gaps 里明说')
+
+    def test_unknown_status_value_surfaces_in_data_gaps(self):
+        """🔴 2026-10-04 验收第 4 问：换状态写法必须当场暴露，不能再无声失灵。"""
+        rows, meta = lo.load_file(self._write([self._row({'广告组投放': '投放中'})]))
+        self.assertFalse(any('状态列' in g for g in meta['data_gaps']),
+                         '认识的词不该告警：%s' % meta['data_gaps'])
+        rows, meta = lo.load_file(self._write([self._row({'广告组投放': 'SomeNewStatus'})]))
+        self.assertTrue(any('状态列' in g and 'SOMENEWSTATUS' in g
+                            for g in meta['data_gaps']),
+                        '未知状态必须在 data_gaps 里亮出来：%s' % meta['data_gaps'])
 
     def test_repeat_click_ratio_not_computed_across_windows(self):
         """分子分母必须同一天。跨窗口硬凑 = 之前踩过的 11 倍误差。"""

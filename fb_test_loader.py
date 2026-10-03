@@ -538,6 +538,21 @@ def load_file(path, fill_zero_days=True, max_rows=200000):
     for r in out:
         statuses[r['status']] = statuses.get(r['status'], 0) + 1
 
+    # 🔴 防再犯（2026-10-04 验收第 4 问）：状态列出现**认不出**的写法时必须在 data_gaps
+    #    里明说。上次「投放中」不认得，护栏把它当「不在投」——强停/提名全部失灵，
+    #    而 meta 里毫无征兆。护栏侧按白名单归一（未知=不在投，宁少提名不误强停）；
+    #    这里负责把「未知」亮出来，换语言/换导出版本/换字段时第一时间被人看到。
+    #    已知词表与 fb_ai_engine._STATUS_ACTIVE_ALIASES 保持同步（此处含在投+不在投两面）。
+    _KNOWN_STATUS = {'ACTIVE', 'PAUSED', 'COMPLETED', 'ARCHIVED', 'DELIVERING',
+                     'IN_PROCESS', 'LEARNING', 'REVIEW', 'NOT_DELIVERING',
+                     '投放中', '学习期', '未投放', '已暂停', '已结束', '已停用'}
+    _unknown = {k: v for k, v in statuses.items()
+                if k and k.upper() not in _KNOWN_STATUS}
+    if _unknown:
+        gaps.add('状态列出现护栏词表以外的值：%s —— 护栏会把它们一律当「不在投」处理'
+                 '（宁少提名不误强停）；若这其实是「在投」的写法，先扩词表再跑'
+                 % ', '.join('%s×%d' % (k, v) for k, v in sorted(_unknown.items())))
+
     # 聚合完才能算得出的缺口（依赖 out）
     n_cbo = sum(1 for r in out if r['budget_type'] == 'CBO')
     if n_cbo:

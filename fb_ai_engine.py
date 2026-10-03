@@ -927,7 +927,8 @@ def apply_guardrails(suggestions, snapshots, config):
 # ---------- 关停护栏 & 加预算提名（2026-10-02）----------
 ACTION_CN = {'pause': '暂停', 'increase_budget': '加预算',
              'decrease_budget': '减预算', 'observe': '观察'}
-STOP_ACTIONS = ('pause', 'decrease_budget')   # 业务上都是「往下压」，护栏按同一口径处理
+STOP_ACTIONS = ('pause', 'decrease_budget')   # 「往下压」的动作：止损线按同一口径认「已在停」；
+                                              # 禁杀线**只禁 pause** —— 减预算不是关停（2026-10-04 改）
 
 
 def _row_index(snapshots):
@@ -1118,7 +1119,10 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
     1) 关停护栏 —— 直接改 action
        · 止损线：net_view.net ≤ KILL_STOP_NET → 强制 pause
          （AI 若是 observe / increase_budget，在这里被换掉）
-       · 禁杀线：net_view.net >  KILL_STOP_NET → 禁止 pause / decrease_budget，降级为 observe
+       · 禁杀线：net_view.net >  KILL_STOP_NET → 禁止 pause（降级为 observe）；
+         **减预算不禁** —— 净额为正只能推出「不该关」，推不出「不该减」
+         （2026-10-04 验收指出：衰退中的盈利广告要能减，别把「不该做最重的动作」
+         读成「什么都不该做」）
        两条线互补，正好盖住两类错：该停没停（漏杀）、不该停却停了（误杀）。
 
     2) 加预算提名 —— **默认不改 action**，只挂 nomination 字段 + 在 reason 里加一句
@@ -1217,7 +1221,11 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
                 stats['forced_pause'] += 1
             continue      # 已经在停，不需要再谈加钱
 
-        if act in STOP_ACTIONS:
+        # 🔴 2026-10-04 验收指出（与删「clicks<100」是同一类错）：减预算**不是关停**——
+        #    净额为正只能推出「不该 pause」，推不出「不该减」。把「不该做最重的动作」
+        #    读成「什么都不该做」，衰退中的盈利广告（近 3 天 0 单、ROAS 1.06、净额 +48）
+        #    连减预算都被禁，只能干等它把毛利烧完。⇒ 禁杀线只禁 pause。
+        if act == 'pause':
             s['ai_action'] = act
             s['action'] = 'observe'
             s['budget_change_pct'] = 0
@@ -1230,8 +1238,8 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         # ---------- 2) 加预算提名（默认只提名，不改动作）----------
         if not ENABLE_BUDGET_NOMINATION or act == 'increase_budget':
             continue
-        if act == 'pause':
-            continue      # 刚被止损的（或者 AI 自己判停的）不提名加钱
+        if act in STOP_ACTIONS:
+            continue      # 已在往下压/停的动作不谈加钱（AI 判减预算的也一样——减着钱还提名加钱是自相矛盾）
         # 🔴 必须先确认它**在投**。2026-10-03 重放当场抓到一个：T-07 是 PAUSED 的，
         #    AI 判的是 observe（正确），但它净额为正 + 顶格 + 频次不饱和 ⇒ 提名了。
         #    「给一条已经停投的广告建议加预算」是荒谬的。
