@@ -290,6 +290,52 @@ class TestGuardrailOverride(unittest.TestCase):
         self.assertFalse(s['nomination']['applied'])
         self.assertIn('提名', s['reason'])
 
+    # ---- 中文状态词归一（2026-10-04 12条14天 GUI 实测抓到的生产 bug）----
+    # 导出列是「投放中/未投放」，护栏只认 'ACTIVE' ⇒ 「投放中」被当成「不在投」：
+    # 该强停的不敢停（理由还自相矛盾），提名被整体跳过（nominated=0）。
+
+    def test_chinese_delivering_status_counts_as_active(self):
+        snap = mk_snapshot('11', net=-7.5, spend=20.0, rev=12.5, fill=1.0, freq=3.2)
+        snap['status'] = '投放中'
+        sugg = [{'campaign_id': '11', 'action': 'increase_budget',
+                 'budget_change_pct': 20, 'reason': '模型想加预算'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(out[0]['action'], 'pause')
+        self.assertEqual(out[0]['guardrail'], 'forced_pause')
+        self.assertNotIn('不在投', out[0]['reason'])
+
+    def test_chinese_delivering_ad_is_nomination_eligible(self):
+        """同一根因的另一面：状态词不认 ⇒ 提名检查被整体跳过（nominated=0）。
+
+        夹具 = 教科书「该加钱」形态（净赚 + 顶格 1.0 + 频次 2.2 + 5 天）。"""
+        snap = mk_snapshot('1', net=50.0, spend=20.0, rev=70.0, fill=1.0, freq=2.2)
+        snap['status'] = '投放中'
+        sugg = [{'campaign_id': '1', 'action': 'observe', 'budget_change_pct': 0,
+                 'reason': '模型观望'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(stats['nominated'], 1)
+        self.assertIn('提名·加预算', out[0]['reason'])
+
+    def test_chinese_not_delivering_still_blocks(self):
+        """「未投放」必须仍然算不在投（归一不能把没在花的钱放进来）。"""
+        snap = mk_snapshot('12', net=-7.5, spend=20.0, rev=12.5, fill=1.0, freq=3.2)
+        snap['status'] = '未投放'
+        sugg = [{'campaign_id': '12', 'action': 'increase_budget',
+                 'budget_change_pct': 20, 'reason': '模型想加预算'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(out[0]['action'], 'observe')
+        self.assertEqual(out[0]['guardrail'], 'blocked_by_precondition')
+        self.assertIn('不在投', out[0]['reason'])
+
+    def test_learning_phase_status_counts_as_active(self):
+        """「学习期」是在真花钱的（Meta 学习期 ≠ 没在投），必须能被强停。"""
+        snap = mk_snapshot('13', net=-7.5, spend=20.0, rev=12.5, fill=1.0, freq=3.2)
+        snap['status'] = '学习期'
+        sugg = [{'campaign_id': '13', 'action': 'increase_budget',
+                 'budget_change_pct': 20, 'reason': '模型想加预算'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(out[0]['guardrail'], 'forced_pause')
+
 
 class TestAbstain(unittest.TestCase):
     def test_low_confidence_abstains_to_rule(self):

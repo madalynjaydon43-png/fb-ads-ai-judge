@@ -122,6 +122,22 @@ STOP_WATCH_SEC_LOW = 3.0       # 平均观看 < 此秒 ⇒ 只被开头钩住（
 STOP_REPEAT_CLICK_HIGH = 0.30  # 重复点击占比 > 此值 ⇒ 少数人反复点（落地页/信任问题）
 STOP_ACTIVE_STATUS = ('ACTIVE',)   # 只有真正在投的才谈得上「止损」
 
+# 🔴 中文导出的状态词归一（2026-10-04 12条14天测试抓到）：Ads Manager 中文界面导出的是
+#    「投放中 / 学习期 / 未投放 / 已暂停」，而下面的比较只认 'ACTIVE' ——
+#    结果「投放中」被当成「不在投」：该强停的不敢停（理由还自相矛盾地写着"投放中（不在投）"），
+#    加预算提名被整体跳过（nominated=0）。归一只在护栏比较处做，prompt 仍展示原文。
+_STATUS_ACTIVE_ALIASES = {'投放中', '学习期', 'DELIVERING', 'IN_PROCESS'}
+
+
+def _norm_status(raw):
+    """把状态词归一到护栏的比较口径：命中「在投」同义词 ⇒ 'ACTIVE'，其余原样大写。
+
+    🔴 刻意用白名单：**未知状态一律仍算「不在投」** —— 归一漏认的代价是少一次提名
+    （人能看到），认错的代价是对没在花的钱做动作（没人拦）。两害取其轻。
+    """
+    st = str(raw or '').strip().upper()
+    return 'ACTIVE' if st in _STATUS_ACTIVE_ALIASES else st
+
 # ---------- 配置 ----------
 AI_CONFIG_DEFAULTS = {
     "base_url": "",          # 例如 https://xxx.9router.com/v1（OpenAI 兼容）
@@ -951,7 +967,7 @@ def _stop_precondition(row, nv, config):
        这两种情况下净额为负是**某一环坏了**的表现，该修那一环；直接关停治不好它，
        还会把一个「流量已经买到了」的渠道砍掉。
     """
-    st = str(row.get('status') or '').strip().upper()
+    st = _norm_status(row.get('status'))
     if st and st not in STOP_ACTIVE_STATUS:
         return True, ('它当前 %s（不在投）—— 本来就没在花钱，关停没有对象，'
                       '该问的是「为什么停了」而不是「要不要停」' % st)
@@ -1219,7 +1235,7 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         # 🔴 必须先确认它**在投**。2026-10-03 重放当场抓到一个：T-07 是 PAUSED 的，
         #    AI 判的是 observe（正确），但它净额为正 + 顶格 + 频次不饱和 ⇒ 提名了。
         #    「给一条已经停投的广告建议加预算」是荒谬的。
-        st = str(row.get('status') or '').strip().upper()
+        st = _norm_status(row.get('status'))
         if st and st not in STOP_ACTIVE_STATUS:
             continue
         fr = nv.get('fill_rate')
