@@ -1474,6 +1474,32 @@ class TestTargetRoas(unittest.TestCase):
         self.assertIsNone(st.get('blocked_by_target_roas'),
                           '未填时不该拦提名：%s' % out[0].get('reason', ''))
 
+    def test_defaults_are_all_disabled(self):
+        """🔴 2026-10-03 实测抓到的文档/代码不一致。
+
+        原来 ，于是**不填也生效**（已经在拦提名），
+        而文档写的是「没填不启用」—— 代码悄悄替用户选了一个数。
+        这正是本项目反复吃亏的那类错（拟合值当业务值）。
+
+        ⇒ 三个目标值的**代码缺省必须都是 None**。要启用就显式填。
+        """
+        self.assertIsNone(eng.TARGET_ROAS, '默认必须是不启用')
+        self.assertIsNone(eng.BREAKEVEN_ROAS)
+        self.assertIsNone(eng.TARGET_CPA)
+        # 且空配置时三个读取函数都得返回 None
+        self.assertIsNone(eng._target_roas({}))
+        self.assertIsNone(eng._breakeven_roas({}))
+        self.assertIsNone(eng._target_cpa({}))
+
+    def test_empty_config_changes_nothing(self):
+        """空配置 ⇒ 行为与「加目标值之前」完全一致（不能偷偷变严）。"""
+        r = self._row()          # ROAS 1.56、净额为正
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {})
+        self.assertNotEqual(st.get('blocked_by_target_roas'), 1,
+                            '空配置不该拦提名：%s' % out[0].get('reason'))
+        self.assertNotEqual(out[0].get('guardrail'), 'forced_pause',
+                            '空配置不该触发 breakeven 止损')
+
     def test_zero_is_not_treated_as_unset(self):
         """🔴 0 = 「我要求 ROAS=0（不设限）」，**不是**「没填」。
 
