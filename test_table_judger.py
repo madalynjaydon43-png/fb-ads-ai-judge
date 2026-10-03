@@ -349,6 +349,43 @@ class TestGuardrailOverride(unittest.TestCase):
         self.assertNotIn('guardrail', out[0])
         self.assertNotIn('提名', out[0]['reason'])
 
+    # ---- 中文成效指标归一（2026-10-04 第三处同族 bug：购物次数 ≠ purchase）----
+
+    def test_chinese_purchase_objective_is_not_blocked_as_wrong_objective(self):
+        """「购物次数」就是购买口径 —— 不得被「口径不适用」前置条件截胡。"""
+        snap = mk_snapshot('21', net=-7.5, spend=20.0, rev=12.5, fill=1.0, freq=3.2)
+        snap['status'] = '投放中'
+        snap['optimization_event'] = '购物次数'
+        sugg = [{'campaign_id': '21', 'action': 'increase_budget',
+                 'budget_change_pct': 20, 'reason': '模型想加预算'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(out[0]['guardrail'], 'forced_pause')
+        self.assertNotIn('口径', out[0]['reason'])
+
+    def test_chinese_add_to_cart_objective_still_blocked(self):
+        """「加入购物车次数」含「购物」二字 —— 顺序反了会把加购当成购买，靶子就真搞错了。"""
+        snap = mk_snapshot('22', net=-7.5, spend=20.0, rev=12.5, fill=1.0, freq=3.2)
+        snap['status'] = '投放中'
+        snap['optimization_event'] = '加入购物车次数'
+        sugg = [{'campaign_id': '22', 'action': 'increase_budget',
+                 'budget_change_pct': 20, 'reason': '模型想加预算'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(out[0]['guardrail'], 'blocked_by_precondition')
+        self.assertIn('不是 purchase', out[0]['reason'])
+
+    def test_chinese_purchase_objective_gets_cpa_reference_tag(self):
+        """购买口径 + CPA 超目标 ⇒【目标参考】标注必须触发（此前被口径检查整段跳过）。"""
+        snap = mk_snapshot('3', net=50.0, spend=20.0, rev=70.0, fill=1.0, freq=2.5)
+        snap['status'] = '投放中'
+        snap['optimization_event'] = '购物次数'
+        snap['cost_per_purchase'] = 49.8
+        sugg = [{'campaign_id': '3', 'action': 'observe', 'budget_change_pct': 0,
+                 'reason': '模型观望'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {'target_cpa': 30})
+        self.assertEqual(stats.get('cpa_reference_flagged'), 1)
+        self.assertIn('【目标参考】', out[0]['reason'])
+        self.assertTrue(out[0].get('cpa_reference'))
+
 
 class TestAbstain(unittest.TestCase):
     def test_low_confidence_abstains_to_rule(self):

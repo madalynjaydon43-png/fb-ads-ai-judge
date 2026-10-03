@@ -138,6 +138,23 @@ def _norm_status(raw):
     st = str(raw or '').strip().upper()
     return 'ACTIVE' if st in _STATUS_ACTIVE_ALIASES else st
 
+
+def _is_purchase_event(opt):
+    """成效指标口径是否「购买」（护栏只对购买口径的广告用购买类判据）。
+
+    🔴 中文导出写的是「购物次数」，英文才是 purchase —— 2026-10-04 12条14天实测：
+    `'purchase' not in '购物次数'` 恒真 ⇒ 11 条购买口径广告全被误判「口径不适用」：
+    该强停的不敢停（前置条件被口径检查截胡）、CPA 参考线一次不触发。
+    🔴 判据顺序：**先排除购物车再认购物** —— 「加入购物车」里含「购物」二字，
+    顺序反了会把加购口径的广告当成购买口径，靶子就真搞错了。
+    """
+    v = str(opt or '').strip().lower()
+    if not v:
+        return False
+    if ('购物车' in v) or ('加购' in v) or ('add_to_cart' in v):
+        return False
+    return ('purchase' in v) or ('购物' in v) or ('购买' in v)
+
 # ---------- 配置 ----------
 AI_CONFIG_DEFAULTS = {
     "base_url": "",          # 例如 https://xxx.9router.com/v1（OpenAI 兼容）
@@ -974,7 +991,7 @@ def _stop_precondition(row, nv, config):
                       '该问的是「为什么停了」而不是「要不要停」' % st)
 
     opt = str(row.get('optimization_event') or '')
-    if opt and 'purchase' not in opt:
+    if opt and not _is_purchase_event(opt):
         short = opt.split('.')[-1] if '.' in opt else opt
         return True, ('它的成效指标是 %s，不是 purchase —— 平台在**为 %s 找人**，'
                       '购买数少是目标决定的，不是它跑坏了' % (opt, short))
@@ -1180,7 +1197,7 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
             # 口径不适用（优化目标不是购买）时不判 —— 那种情况 ROAS 天然低，
             # 用它卡止损就是「按加购口径的广告去比购买口径」，会把靶子搞错。
             _opt = str(row.get('optimization_event') or '')
-            if _r is not None and (not _opt or 'purchase' in _opt):
+            if _r is not None and (not _opt or _is_purchase_event(_opt)):
                 _hit_be = _r < _be
         if _hit_stop or _hit_be:
             if act not in STOP_ACTIONS:
@@ -1261,7 +1278,7 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
             _r = _roas_of(nv)
             _opt = str(row.get('optimization_event') or '')
             # 口径不适用时不用这个线（加购广告的购买 ROAS 天然低，不是它跑得差）
-            if _r is not None and _r < target_roas and (not _opt or 'purchase' in _opt):
+            if _r is not None and _r < target_roas and (not _opt or _is_purchase_event(_opt)):
                 s['nomination'] = {
                     'blocked_by': 'target_roas',
                     'target_roas': target_roas, 'roas': round(_r, 2),
@@ -1284,7 +1301,7 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
             _orders = _num(row.get('purchase'))
             _sp = _num(nv.get('spend'))
             _over = False
-            if (not _opt or 'purchase' in _opt):   # 口径不适用（加购等）不提醒
+            if (not _opt or _is_purchase_event(_opt)):   # 口径不适用（加购等）不提醒
                 if _c is not None and _c > target_cpa:
                     _over = True
                 # 🔴 花了钱一单没出 ⇒ CPA 是「无限大」，**不是 0**（0 会被读成「零成本、超划算」）
