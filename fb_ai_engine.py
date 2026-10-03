@@ -50,9 +50,9 @@ KILL_STOP_NET = 0.0       # 止损线：可见窗口净额 ≤ 此值 → 强制
                                 #   ROAS = 1/毛利率（40% 毛利 ⇒ 2.5；50% ⇒ 2.0）。见下方 TARGET_ROAS。
 
 # ---------- 业务目标输入（2026-10-03 用户提出：要按「我要求多少」判断，不是只按「有没有亏」）
-# 用户只填两个数，就是他自己的生意目标：
-#   ① target_roas = **我要的 ROI**：花 1 块钱要带回几块。填 3.0 = 投 100 回 300。
-#   ② target_cpa  = **我多少钱出一单**：一单最多花多少。填 80 = 超过 80 块/单就不划算。
+# 2026-10-03 晚用户拍板：**只留一个业务目标** —— target_cpa（我多少钱出一单），且**仅做参考、
+# 不是绝对判定标准**：超线不拦提名，护栏只在结论里标注提醒（cpa_reference），拦不拦由人决定。
+# target_roas（ROI）退出：GUI 已撤输入入口；门槛代码保留休眠，手工填进配置才会生效。
 # ⚠️ 这两个值**必须由用户填**，不能由代码猜 —— 猜出来的阈值和当初那个 1.35 拟合值一样，
 #    换生意就失真。所以：config 里没给 ⇒ **该判据不启用**（而不是用默认值悄悄生效）。
 # 🔴 别让用户填「毛利率」再反推（2026-10-03 纠正）：毛利率是他的内部财务口径，
@@ -64,16 +64,19 @@ TARGET_ROAS = None          # 目标 ROAS（**我要的 ROI**）。**默认 None
                             #   反复吃亏的那类错（拟合值当业务值）。要启用就显式填。
                             #   （只有毛利率想换算时：ROAS ≈ 1 ÷ 毛利率。但那是成本口径，
                             #    不是目标口径，别拿它当 target 用。）
+                            #   🔴 2026-10-03 晚：用户拍板不要 ROI，GUI 已撤输入入口；
+                            #   门槛代码保留休眠 —— 只有手工把它填进配置才会生效。
 BREAKEVEN_ROAS = None       # 【可选·高级】想让「止损线」比「净额≤0」更严时才填，
                             #   **直接填 ROAS 数值**（如 1.5），不是填毛利率。
                             #   不填 ⇒ 止损线就是 net<=0（花的钱没回来 = 亏，会计恒等式，不用配置）。
                             #   🔴 止损线不能拿 TARGET_ROAS 顶替：小额失血会一直烧钱，
                             #   止损要卡在「不亏」，而 target 是「够赚」——
                             #   **止损线 = 不亏，加预算资格线 = 达到我的目标。两条线不同档。**
-TARGET_CPA = None           # 目标 CPA（**我多少钱出一单**）。**默认不启用** ——
+TARGET_CPA = None           # 目标 CPA（**我多少钱出一单**）—— 唯一的业务目标输入。**默认不启用**：
                             #   CPA 是绝对金额、跨品类差几十倍，代码猜不出来，只能用户给。
-                            #   🔴 2026-10-03 接线：原来它只进 prompt（_cpa_of 写了却没人调用 = 死代码），
-                            #   现在真的进「加预算资格线」——超了就不给加钱。
+                            #   🔴 2026-10-03 接线：原来它只进 prompt（_cpa_of 写了却没人调用 = 死代码）。
+                            #   🔴 2026-10-03 晚用户拍板：**仅做参考，不是绝对判定标准** ——
+                            #   超线不拦提名，护栏只在结论里标注提醒，拦不拦由人决定。
 # ⚠️ 「未提供 ⇒ 不启用」的判断都用 `is None`，**不是 falsy** ——
 #   0 是「我要求 ROAS=0」（= 不设限），None 才是「我没填」。用 `or` 会把 0 当成没填。
 
@@ -456,22 +459,23 @@ def _flag_section(snapshot):
 
 
 def _target_block(config):
-    """组装「你的目标值」段落。**没填的项不出现** —— 让 AI 知道哪些是硬要求、哪些没要求。"""
+    """组装「你的目标值」段落。**没填的项不出现** —— 让 AI 知道哪些是硬线、哪些只是参考线。"""
     config = config or {}      # build_prompt 允许 config=None；忘了这层会 TypeError
     tr = _target_roas(config)
     be = _breakeven_roas(config)
     tc = _target_cpa(config)
     if tr is None and be is None and tc is None:
         return ''
-    L = ['【我的目标值（这是硬要求，不是参考）】']
+    L = ['【我的目标值】']
     if tc is not None:
-        L.append('- **目标 CPA = $%.2f / 单**：出一单我最多花这么多钱，超过就不划算' % tc)
+        L.append('- **目标 CPA = $%.2f / 单（仅做参考，不是硬标准）**：出一单我最多想花这么多，'
+                 '超了请在理由里写清单均成本、并提醒人工复核' % tc)
     if tr is not None:
         L.append('- **目标 ROAS = %.2f**：花 1 块要带回 %.2f 块，达不到就不配加预算' % (tr, tr))
     if be is not None:
         L.append('- 盈亏平衡 ROAS = %.2f：低于它就是净亏' % be)
     L.append('')
-    L.append('  ⚠️ **三档线的区别必须分清（这是最容易搞错的地方）**：')
+    L.append('  ⚠️ **线的分档必须分清（这是最容易搞错的地方）**：')
     if be is not None:
         L.append('    · ROAS < %.2f  → **该关**：它在净亏，放量只会亏更多' % be)
     else:
@@ -481,19 +485,16 @@ def _target_block(config):
                  '但没达到我要的回报，加钱只是把差距放大；**不该关**，继续看' % tr)
         L.append('    · ROAS ≥ %.2f → 才**有资格**谈加预算（还要叠加顶格率、频次条件）' % tr)
     if tc is not None:
-        L.append('    · CPA > $%.2f / 单 → **不加预算**：单均成本超了我的上限，'
-                 '放量只是买更多贵单' % tc)
+        L.append('    · CPA > $%.2f / 单 → **参考线**：单均成本超了我的上限，加预算要谨慎 —— '
+                 '不是硬性禁止，但理由必须写明单均成本、并提醒人工复核' % tc)
     if tr is not None and tc is not None:
-        L.append('  ⇒ **两把尺子都要过**：ROAS 是「每一块钱带回多少」（倍数），'
-                 'CPA 是「出一单花多少」（绝对金额）。客单价不同，两把尺子会给出不同答案 —— '
-                 '比如单多但每单很小（ROAS 高、CPA 低）看着都好，'
-                 '而单少但每单很大（ROAS 高、CPA 也高）就会打架。'
-                 '**加预算必须两条同时达标**，只过一条不算。')
+        L.append('  ⇒ 目标 ROAS 是加预算的**硬资格线**，目标 CPA 只是**参考线**：'
+                 'CPA 超线不拦提名，但必须写进理由提醒人工。')
     if tc is not None:
         L.append('  ⇒ **花了钱却一单没出时，CPA 算不出来（= 单均成本无限大），'
-                 '不是 CPA=0**。别把「没单」读成「零成本」，那种情况按不达标处理。')
+                 '不是 CPA=0**。别把「没单」读成「零成本」，那种情况也要按单均成本无限大提醒人工。')
     L.append('  ⇒ **「净额为正」不等于「该加预算」**：净额为正只说明广告费回本了，'
-             '够不够好要看它有没有达到我上面的目标值。')
+             '够不够好要结合上面的目标值综合判断，别只看回没回本。')
     L.append('  ⇒ 成效指标不是 purchase 的广告（加购/结账等），**这些线对它不适用**，'
              '别拿购买口径的 ROAS / CPA 去判它跑得好不好。')
     L.append('')
@@ -1250,17 +1251,16 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
                 stats['blocked_by_target_roas'] = stats.get('blocked_by_target_roas', 0) + 1
                 continue
 
-        # 🔴 2026-10-03 接线：加预算资格线② —— CPA 不能超过「我多少钱出一单」。
-        #    ROAS 是倍数、CPA 是绝对金额，**两把尺子独立，两条都要过**才配加预算
-        #    （单多而每单小：ROAS 高但 CPA 也高；单少而每单大：ROAS 高、CPA 更高 —— 会打架）。
-        #    ⚠️ _cpa_of 之前写了却没有任何调用点 = 死代码 ⇒ 第二个目标形同没生效。现在接上。
+        # 🔴 2026-10-03 晚用户拍板：目标 CPA **仅做参考，不是绝对判定标准** ——
+        #    超线**不再拦截**加预算提名（原「资格线②」作废），只在结论里标注提醒，
+        #    拦不拦由人工决定。零单 = CPA 无限大（不是 0）的口径保持不变。
         if target_cpa is not None:
             _c = _cpa_of(nv, row)
             _opt = str(row.get('optimization_event') or '')
             _orders = _num(row.get('purchase'))
             _sp = _num(nv.get('spend'))
             _over = False
-            if (not _opt or 'purchase' in _opt):   # 口径不适用（加购等）不判
+            if (not _opt or 'purchase' in _opt):   # 口径不适用（加购等）不提醒
                 if _c is not None and _c > target_cpa:
                     _over = True
                 # 🔴 花了钱一单没出 ⇒ CPA 是「无限大」，**不是 0**（0 会被读成「零成本、超划算」）
@@ -1271,20 +1271,16 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
                 _why_cpa = ('窗口 CPA $%.2f / 单 > 目标 $%.2f / 单' % (_c, target_cpa)
                             if _c is not None
                             else '花了钱却一单没出（CPA 算不出来 = 单均成本无限大）')
-                s['nomination'] = {
-                    'blocked_by': 'target_cpa',
+                s['cpa_reference'] = {
                     'target_cpa': target_cpa,
                     'cpa': (round(_c, 2) if _c is not None else None),
-                    'note': ('单均成本 %.2f 超过目标 %.2f' % (_c, target_cpa)) if _c is not None
-                            else '零单，CPA 无法计算',
+                    'note': '仅参考，不拦截提名，由人工决定',
                 }
                 s['reason'] = (s.get('reason', '') +
-                               '【护栏·加预算资格】%s ⇒ **不给它加预算**：'
-                               '我的目标是「一单最多花 $%.2f」，超了就是在买贵单，'
-                               '放量只会买更多（原判「%s」保留，人工可复核）。'
-                               % (_why_cpa, target_cpa, ACTION_CN.get(act, act)))
-                stats['blocked_by_target_cpa'] = stats.get('blocked_by_target_cpa', 0) + 1
-                continue
+                               '【目标参考】%s —— 此线**仅做参考**、不拦提名，'
+                               '加预算前请人工复核单均成本。'
+                               % _why_cpa)
+                stats['cpa_reference_flagged'] = stats.get('cpa_reference_flagged', 0) + 1
 
         # 频次增幅：只在首末都拿到时才算，拿不到就不 disqualify（信息缺失 ≠ 不合格）
         growth = None

@@ -1619,15 +1619,12 @@ class TestTargetRoas(unittest.TestCase):
         self.assertIsNone(eng._target_cpa({}))
 
 class TestTargetCpa(unittest.TestCase):
-    """第二个业务目标：「我多少钱出一单」（2026-10-03 接线）。
+    """业务目标：「我多少钱出一单」（2026-10-03 接线；同日晚用户拍板改**仅做参考**）。
 
-    🔴 起因：`_cpa_of()` 写了、测试也测了，**却没有任何调用点** ——
-    也就是说这个目标只被拼进 prompt 当一句话，根本没进判断。
-    用户要的是「这两个就是我的优化目标」，只当提示词等于没接。
-
-    CPA 与 ROAS 是**两把独立的尺子**：ROAS 是倍数（每 1 块带回多少），
-    CPA 是绝对金额（出一单花多少）。客单价不同，两把尺子会给不同答案
-    ⇒ 规矩是**两条都要过**才配加预算。
+    🔴 2026-10-03 晚用户拍板：目标 CPA **仅做参考，不是绝对判定标准** ——
+    超线**不再拦截**加预算提名（原「资格线②」作废），护栏只在结论里标注提醒
+    （cpa_reference / cpa_reference_flagged），拦不拦由人工决定。
+    零单 = CPA 无限大（≠ 0）的口径保持不变。
     """
 
     BUY = 'actions:offsite_conversion.fb_pixel_purchase'
@@ -1650,39 +1647,42 @@ class TestTargetCpa(unittest.TestCase):
                  'reason': '模型原判'}]
 
     def test_unset_target_cpa_means_no_gate(self):
-        """没填 ⇒ 资格线不生效（CPA 差几十倍，代码不能替用户猜）。"""
+        """没填 ⇒ 参考线不生效（CPA 差几十倍，代码不能替用户猜）。"""
         r = self._row()
         out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': None})
-        self.assertIsNone(st.get('blocked_by_target_cpa'),
-                          '未填时不该拦：%s' % out[0].get('reason', ''))
+        self.assertIsNone(st.get('cpa_reference_flagged'),
+                          '未填时不该提醒：%s' % out[0].get('reason', ''))
 
-    def test_cpa_over_target_blocks_nomination(self):
-        """单均成本 $54 > 目标 $20 ⇒ 不给加预算（钱是赚了，但每单买得太贵）。"""
+    def test_cpa_over_target_flags_reference(self):
+        """单均成本 $54 > 目标 $20 ⇒ **只标注提醒，不拦提名**（2026-10-03 晚拍板：仅做参考）。"""
         r = self._row(spend=540.0, rev=1620.0, orders=10)    # ROAS 3.0、CPA 54
         out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': 20.0})
-        self.assertEqual(st.get('blocked_by_target_cpa'), 1)
-        self.assertEqual(out[0]['nomination']['blocked_by'], 'target_cpa')
-        self.assertIn('不给它加预算', out[0]['reason'])
+        self.assertEqual(st.get('cpa_reference_flagged'), 1)
+        self.assertIn('【目标参考】', out[0]['reason'])
+        self.assertIn('仅做参考', out[0]['reason'])
+        self.assertIn('nomination', out[0], '参考线不许拦提名')
+        self.assertNotIn('blocked_by', out[0]['nomination'])
 
     def test_cpa_within_target_allows_nomination(self):
         """CPA $10 ≤ 目标 $20 ⇒ 提名照常发生（**确认没被新线误拦**）。"""
         r = self._row()
         out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': 20.0})
-        self.assertNotEqual(st.get('blocked_by_target_cpa'), 1,
-                            '达标却被拦：%s' % out[0].get('reason'))
+        self.assertIsNone(st.get('cpa_reference_flagged'),
+                          '达标却被告警：%s' % out[0].get('reason'))
         self.assertIn('nomination', out[0])
 
-    def test_two_rulers_are_independent(self):
-        """🔴 两把尺子都要过：ROAS 达标（3.0 ≥ 2.0）但 CPA 超标（54 > 20）⇒ 仍不给加钱。
+    def test_cpa_reference_does_not_block_when_roas_met(self):
+        """🔴 2026-10-03 晚拍板：ROAS 达标（3.0 ≥ 2.0）但 CPA 超标（54 > 20）⇒ 提名照常、只提醒。
 
-        这就是「单少而每单很大」的情形 —— 只盯着 ROAS 看它很漂亮，
-        可换成「一单多少钱」就不划算了。两把尺子必须各自独立拦。
+        这就是「单少而每单很大」的情形 —— CPA 参考线把它点出来，
+        拦不拦由人决定，代码不再代拦。
         """
         r = self._row(spend=540.0, rev=1620.0, orders=10)
         out, st = eng.enforce_risk_guardrails(self._sugg(), [r],
                                               {'target_roas': 2.0, 'target_cpa': 20.0})
         self.assertIsNone(st.get('blocked_by_target_roas'), 'ROAS 是达标的，不该由它拦')
-        self.assertEqual(st.get('blocked_by_target_cpa'), 1, '应由 CPA 线拦下')
+        self.assertEqual(st.get('cpa_reference_flagged'), 1, 'CPA 超标应有参考提醒')
+        self.assertIn('nomination', out[0], '参考线不许拦提名')
 
     def test_zero_orders_is_not_zero_cpa(self):
         """🔴 花了钱一单没出 ⇒ CPA 是「无限大」，**不是 0**（0 会被读成零成本、超划算）。
@@ -1693,15 +1693,15 @@ class TestTargetCpa(unittest.TestCase):
         r = self._row(spend=540.0, rev=842.0, orders=0, cost_per_purchase=0)
         self.assertIsNone(eng._cpa_of(r['net_view'], r), '零单时 CPA 必须是 None（≠0）')
         out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': 20.0})
-        self.assertEqual(st.get('blocked_by_target_cpa'), 1)
+        self.assertEqual(st.get('cpa_reference_flagged'), 1)
         self.assertIn('一单没出', out[0]['reason'])
 
     def test_cart_opt_ad_is_exempt_from_cpa_line(self):
         """加购口径的广告没有「购买单」可言 —— 拿购买 CPA 卡它就是把靶子搞错。"""
         r = self._row(opt=self.CART, spend=540.0, rev=1620.0, orders=10)
         out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_cpa': 20.0})
-        self.assertIsNone(st.get('blocked_by_target_cpa'),
-                          '加购口径不该被购买 CPA 拦：%s' % out[0].get('reason'))
+        self.assertIsNone(st.get('cpa_reference_flagged'),
+                          '加购口径不该被购买 CPA 提醒：%s' % out[0].get('reason'))
 
     def test_prompt_carries_cpa_target(self):
         """CPA 目标要出现在 prompt 里，且写清楚「没单 ≠ 零成本」。"""
@@ -1712,6 +1712,7 @@ class TestTargetCpa(unittest.TestCase):
         self.assertIn('目标 CPA', p)
         self.assertIn('一单没出', p)      # 「没单 ≠ CPA=0」这句必须在
         self.assertIn('80.00', p)
+        self.assertIn('仅做参考', p)      # 2026-10-03 晚：参考线口径必须在
 
 
 if __name__ == '__main__':
