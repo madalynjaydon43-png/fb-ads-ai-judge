@@ -124,7 +124,8 @@ def mk_snapshot(sid, net=None, fill=0.5, freq=1.2, days=5, spend=10.0, rev=5.0):
     if net is not None:
         snap['net_view'] = {'days': days, 'spend': spend, 'revenue': rev,
                             'net': net, 'roas': (rev / spend) if spend else 0,
-                            'active_days': days, 'fill_rate': fill, 'freq_last': freq}
+                            'active_days': days, 'fill_rate': fill, 'freq_last': freq,
+                            'budget_util': fill}   # 夹具默认与 fill 同值；专测利用率的用例单独覆盖
     return snap
 
 
@@ -385,6 +386,31 @@ class TestGuardrailOverride(unittest.TestCase):
         self.assertEqual(stats.get('cpa_reference_flagged'), 1)
         self.assertIn('【目标参考】', out[0]['reason'])
         self.assertTrue(out[0].get('cpa_reference'))
+
+    def test_nomination_uses_budget_utilization_not_day_fraction(self):
+        """🔴 2026-10-04 用户拍板：提名线①从天数占比改利用率。
+
+        AD001 实测形态：天数占比只有 0.571（CPM 噪声晃到 93% 的天全被扣），
+        利用率 0.974 —— 按「预算卡住了它」的本意，这条必须被提名。"""
+        snap = mk_snapshot('1', net=50.0, spend=20.0, rev=70.0, fill=0.571, freq=2.5)
+        snap['net_view']['budget_util'] = 0.974
+        snap['status'] = '投放中'
+        sugg = [{'campaign_id': '1', 'action': 'observe', 'budget_change_pct': 0,
+                 'reason': '模型观望'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(stats['nominated'], 1)
+        self.assertIn('预算利用率 0.97', out[0]['reason'])
+
+    def test_nomination_skipped_when_utilization_low(self):
+        """AD002 形态：利用率 0.54（预算根本没花满）⇒ 不提名 —— 瓶颈不在额度。"""
+        snap = mk_snapshot('2', net=50.0, spend=20.0, rev=70.0, fill=0.571, freq=2.5)
+        snap['net_view']['budget_util'] = 0.54
+        snap['status'] = '投放中'
+        sugg = [{'campaign_id': '2', 'action': 'observe', 'budget_change_pct': 0,
+                 'reason': '模型观望'}]
+        out, stats = eng.enforce_risk_guardrails(sugg, [snap], {})
+        self.assertEqual(stats['nominated'], 0)
+        self.assertNotIn('提名·加预算', out[0]['reason'])
 
 
 class TestAbstain(unittest.TestCase):
@@ -1278,7 +1304,7 @@ class TestStopPrecondition(unittest.TestCase):
         r.update(over)
         nv = {'net': round(float(r['purchase_value']) - float(r['spend']), 2),
               'spend': r['spend'], 'revenue': r['purchase_value'],
-              'fill_rate': 1.0, 'freq_first': 2.0, 'freq_last': 2.4, 'days': 5}
+              'fill_rate': 1.0, 'budget_util': 1.0, 'freq_first': 2.0, 'freq_last': 2.4, 'days': 5}
         # ⚠️ net_view 必须挂在 row 上：护栏是 `row.get('net_view')` 读的，
         #    返回一个独立的字典会让它走 no_net 提前返回 —— 看着像「护栏没生效」。
         r['net_view'] = nv
@@ -1416,7 +1442,7 @@ class TestNomination(unittest.TestCase):
         r = {'id': 'ad1', 'name': 'X', 'status': 'ACTIVE', 'optimization_event': self.BUY,
              'clicks': 2200, 'net_view': {
                  'net': 2225.0, 'spend': 750.0, 'revenue': 2975.0,
-                 'fill_rate': 1.0, 'freq_first': 1.9, 'freq_last': 2.4, 'days': 5}}
+                 'fill_rate': 1.0, 'budget_util': 1.0, 'freq_first': 1.9, 'freq_last': 2.4, 'days': 5}}
         r.update(over)
         return r
 
@@ -1564,7 +1590,7 @@ class TestTargetRoas(unittest.TestCase):
              'clicks': 800, 'cost_per_purchase': spend / max(orders, 1)}
         r.update(over)
         r['net_view'] = {'net': round(rev - spend, 2), 'spend': spend, 'revenue': rev,
-                         'roas': round(rev / spend, 2), 'fill_rate': 1.0,
+                         'roas': round(rev / spend, 2), 'fill_rate': 1.0, 'budget_util': 1.0,
                          'freq_first': 2.2, 'freq_last': 2.4, 'days': 5}
         return r
 
@@ -1744,7 +1770,7 @@ class TestTargetCpa(unittest.TestCase):
              'clicks': 800, 'cost_per_purchase': spend / max(orders, 1)}
         r.update(over)
         r['net_view'] = {'net': round(rev - spend, 2), 'spend': spend, 'revenue': rev,
-                         'roas': round(rev / spend, 2), 'fill_rate': 1.0,
+                         'roas': round(rev / spend, 2), 'fill_rate': 1.0, 'budget_util': 1.0,
                          'freq_first': 2.2, 'freq_last': 2.4, 'days': 5}
         return r
 

@@ -81,7 +81,7 @@ TARGET_CPA = None           # 目标 CPA（**我多少钱出一单**）—— �
 #   0 是「我要求 ROAS=0」（= 不设限），None 才是「我没填」。用 `or` 会把 0 当成没填。
 
 
-NOMINATE_FILL_RATE = 0.90  # 提名线①：顶格率 ≥ 此值 —— 预算卡住了它，不是它跑不动
+NOMINATE_FILL_RATE = 0.90  # 提名线①：预算利用率 ≥ 此值（budget_util，平均每天花掉预算的比例）—— 预算卡住了它，不是它跑不动。2026-10-04 从天数占比口径改利用率，用户拍板
 NOMINATE_FREQ_MAX = 1.35   # 提名线②（**旧值，已被 ③ 取代，保留仅为兼容旧 config**）
 NOMINATE_FREQ_SATURATED = 3.5   # 提名线②：末段频次 < 此值才算「受众还没看腻」
                                 #   🔴 原值 1.35 是在 v5 数据上拟合的，换数据立刻失真 ——
@@ -315,6 +315,12 @@ def _net_view(days, daily_budget=None):
     }
     if active > 0:
         out["fill_rate"] = round(full_days / active, 3)
+        # 🔴 预算利用率（2026-10-04 用户拍板新增）：平均每个有花费天花掉预算的比例。
+        #    与 fill_rate（≥95% 预算的天数占比）并存：探索期识别用天数占比，
+        #    加预算提名用利用率 —— 同一条 AD001 两口径实测 0.571 vs 0.974：
+        #    天数口径会把被 CPM 噪声晃到 93% 的天全判成「没顶格」，错过真该加钱的广告。
+        if float(daily_budget or 0) > 0:
+            out["budget_util"] = round(spend_total / active / float(daily_budget), 3)
     if freq_first is not None:
         out["freq_first"] = round(freq_first, 3)
         out["freq_last"] = round(freq_last, 3)
@@ -1263,7 +1269,10 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         st = _norm_status(row.get('status'))
         if st and st not in STOP_ACTIVE_STATUS:
             continue
-        fr = nv.get('fill_rate')
+        # 🔴 2026-10-04 用户拍板：提名线①从「≥95% 预算的天数占比」改为「预算利用率」
+        #    （budget_util = 平均每个有花费天花掉预算的比例）。探索期识别
+        #    （_stop_precondition）仍用 fill_rate 天数口径，两条线各管各的。
+        fr = nv.get('budget_util')
         fl = nv.get('freq_last')
         ff = nv.get('freq_first')
         if fr is None or fl is None:
@@ -1336,13 +1345,13 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
             continue
         s['nomination'] = {
             'suggested_action': 'increase_budget',
-            'rule': 'net>%.2f 且 顶格率>=%.2f 且 末段频次<%.2f（饱和线）且 频次增幅<=%.2f 且 天数>=%d'
+            'rule': 'net>%.2f 且 预算利用率>=%.2f 且 末段频次<%.2f（饱和线）且 频次增幅<=%.2f 且 天数>=%d'
                     % (stop_net, fill_min, freq_max, growth_max, min_days),
-            'net': round(net, 2), 'fill_rate': fr, 'freq_last': fl,
+            'net': round(net, 2), 'budget_util': fr, 'freq_last': fl,
             'freq_growth': (round(growth, 2) if growth is not None else None),
             'applied': apply_nom,
         }
-        tail = ('【提名·加预算】净额 %+.2f 在赚、顶格率 %.2f（预算卡住了它）、末段频次 %.2f'
+        tail = ('【提名·加预算】净额 %+.2f 在赚、预算利用率 %.2f（预算卡住了它）、末段频次 %.2f'
                 '（受众还没到饱和线 %.2f%s）→ 建议人工复核是否加预算'
                 % (net, fr, fl, freq_max,
                    '' if growth is None else '、频次增幅 %+.2f' % growth))
