@@ -1439,5 +1439,158 @@ class TestLossAttributionPrompt(unittest.TestCase):
         self.assertIn('已经试过什么、为什么不管用', p)
 
 
+class TestTargetRoas(unittest.TestCase):
+    """目标值判据（2026-10-03 用户提出）。
+
+    起因是实测出的真漏洞：`net > 0 + 顶格 + 频次不饱和` 会被提名加预算，
+    可那批广告 ROAS 只有 1.17~1.56 —— 按 50% 毛利全都在亏，加钱只是亏更快。
+    根因：`net > 0` 等价于「ROAS >= 1」，而广告费的真实盈亏线是 **ROAS = 1/毛利率**。
+    """
+
+    BUY = 'actions:offsite_conversion.fb_pixel_purchase'
+    CART = 'actions:offsite_conversion.fb_pixel_add_to_cart'
+
+    def _row(self, spend=540.0, rev=842.0, orders=24, opt=None, **over):
+        """默认造一条：净额为正、ROAS≈1.56、天天顶格、频次 2.4（= 那条真漏洞）。"""
+        r = {'id': 'a1', 'name': 'X', 'status': 'ACTIVE',
+             'optimization_event': opt or self.BUY,
+             'spend': spend, 'purchase_value': rev, 'purchase': orders,
+             'clicks': 800, 'cost_per_purchase': spend / max(orders, 1)}
+        r.update(over)
+        r['net_view'] = {'net': round(rev - spend, 2), 'spend': spend, 'revenue': rev,
+                         'roas': round(rev / spend, 2), 'fill_rate': 1.0,
+                         'freq_first': 2.2, 'freq_last': 2.4, 'days': 5}
+        return r
+
+    def _sugg(self, act='observe'):
+        return [{'campaign_id': 'a1', 'action': act, 'budget_change_pct': 0,
+                 'reason': '模型原判'}]
+
+    # ---------- 读取：未填必须真的不启用 ----------
+    def test_unset_target_roas_means_no_gate(self):
+        """没填目标 ROAS ⇒ 资格线不生效（不能悄悄用默认值，那等于代码替用户做决定）。"""
+        r = self._row()
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_roas': None})
+        self.assertIsNone(st.get('blocked_by_target_roas'),
+                          '未填时不该拦提名：%s' % out[0].get('reason', ''))
+
+    def test_zero_is_not_treated_as_unset(self):
+        """🔴 0 = 「我要求 ROAS=0（不设限）」，**不是**「没填」。
+
+        用 `or` 读配置会把 0 当成没填、悄悄退回默认值 —— 那是另一种错。
+        """
+        self.assertIsNone(eng._target_roas({'target_roas': 0}))
+        self.assertIsNone(eng._breakeven_roas({'breakeven_roas': 0}))
+        self.assertIsNone(eng._target_cpa({'target_cpa': 0}))
+        self.assertEqual(eng._target_roas({'target_roas': 2.5}), 2.5)
+
+    # ---------- 加预算资格线 ----------
+    def test_blocks_nomination_below_target_roas(self):
+        """🔴 这就是那个真漏洞：净额为正但 ROAS 1.56 < 目标 2.0 ⇒ 不予提名。"""
+        r = self._row()
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_roas': 2.0})
+        self.assertEqual(st.get('blocked_by_target_roas'), 1)
+        self.assertEqual(out[0]['nomination']['blocked_by'], 'target_roas')
+        self.assertIn('不给它加预算', out[0]['reason'])
+
+    def test_nomination_allowed_when_target_met(self):
+        """ROAS 达标（3.5 ≥ 2.0）⇒ 提名照常发生（**要确认没被新资格线误拦**）。"""
+        r = self._row(spend=300.0, rev=1050.0, orders=30)
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r], {'target_roas': 2.0})
+        self.assertNotEqual(st.get('blocked_by_target_roas'), 1,
+                            '达标却被拦：%s' % out[0].get('reason'))
+        self.assertIn('nomination', out[0], '提名应照常发生')
+
+    # ---------- 止损线：breakeven 与 target 必须不同档 ----------
+    def test_breakeven_catches_positive_net_but_below_breakeven(self):
+        """🔴 核心：净额 **为正** 但 ROAS 1.56 < 盈亏线 2.0 ⇒ 强制停。
+        「只看不亏」根本抓不到这类广告。"""
+        r = self._row()
+        out, st = eng.enforce_risk_guardrails(self._sugg('increase_budget'), [r],
+                                              {'breakeven_roas': 2.0})
+        self.assertEqual(out[0]['action'], 'pause', out[0].get('reason'))
+        self.assertEqual(out[0]['guardrail'], 'forced_pause')
+        self.assertIn('卖得越多亏得越多', out[0]['reason'])
+
+    def test_target_roas_is_NOT_used_as_stoploss(self):
+        """🔴 两档线必须分开：拿 target 当止损线，成批误杀「在赚但没到目标」的好广告。
+
+        这条 ROAS 2.5：高于 breakeven(2.0) 所以不亏，但低于 target(3.0)。
+        正确处置 = **保持不动**（不加预算也不关停），不是 pause。
+        """
+        r = self._row(spend=300.0, rev=750.0, orders=10)
+        out, st = eng.enforce_risk_guardrails(self._sugg(), [r],
+                                              {'breakeven_roas': 2.0, 'target_roas': 3.0})
+        self.assertNotEqual(out[0].get('guardrail'), 'forced_pause',
+                            '不该被止损：%s' % out[0].get('reason'))
+        self.assertEqual(out[0]['action'], 'observe')
+
+    def test_no_breakeven_keeps_net_line_only(self):
+        """没填盈亏线 ⇒ 止损线退回 net<=0（旧行为，不悄悄变严）。"""
+        r = self._row()
+        out, st = eng.enforce_risk_guardrails(self._sugg('increase_budget'), [r],
+                                              {'breakeven_roas': None})
+        self.assertNotEqual(out[0].get('guardrail'), 'forced_pause')
+
+    # ---------- 口径不适用时不得判 ----------
+    def test_cart_opt_ad_is_exempt_from_roas_lines(self):
+        """🔴 加购口径的广告，购买 ROAS 天然低 —— 用它卡线就是把靶子搞错。"""
+        r = self._row(opt=self.CART)
+        out, st = eng.enforce_risk_guardrails(self._sugg('increase_budget'), [r],
+                                              {'breakeven_roas': 2.0, 'target_roas': 2.0})
+        self.assertNotEqual(out[0].get('guardrail'), 'forced_pause',
+                            '加购口径不该被购买 ROAS 止损：%s' % out[0].get('reason'))
+        self.assertNotEqual(st.get('blocked_by_target_roas'), 1)
+
+    # ---------- 缺数据不得当 0 ----------
+    def test_missing_roas_is_not_treated_as_zero(self):
+        """🔴 拿不到 ROAS ⇒ 不参与判定。**没数据不是「最坏」，绝不能当 0。**
+
+        这里造的是**真正的缺列**（revenue 整个键不存在）。
+        之前我第一版把 revenue 设成 0 —— 那组数据自相矛盾（0 收入却净额为正 +302），
+        夹具不成立，测出来的是「夹具的问题」不是「代码的问题」。
+        """
+        r = self._row()
+        r['net_view'].pop('roas', None)
+        r['net_view'].pop('revenue', None)      # 缺列，不是 0
+        out, st = eng.enforce_risk_guardrails(self._sugg('increase_budget'), [r],
+                                              {'breakeven_roas': 2.0})
+        self.assertNotEqual(out[0].get('guardrail'), 'forced_pause',
+                            '数据缺失不等于 ROAS=0：%s' % out[0].get('reason'))
+
+    def test_zero_roas_falls_through_to_recompute(self):
+        """取数层在拿不到回收时可能落 `roas=0` ⇒ 必须回退到 revenue/spend 重算，
+        否则一条**有真实回收**的广告会被当成 ROAS 最低而强制停。"""
+        r = self._row(spend=300.0, rev=1050.0, orders=30)   # 真实 ROAS = 3.5
+        r['net_view']['roas'] = 0.0          # 取数层落的 0，**不是**真的零
+        self.assertAlmostEqual(eng._roas_of(r['net_view']), 3.5, places=2)
+
+    # ---------- prompt 必须写进去 ----------
+    def test_prompt_carries_target_values(self):
+        snap = {'id': 'a1', 'name': 'X', 'status': 'ACTIVE', 'spend': 100.0,
+                'clicks': 100, 'purchase': 0, 'daily_spend': []}
+        p = eng.build_prompt([snap], {'breakeven_roas': 2.0, 'target_roas': 3.0},
+                             window=('2026-04-01', '2026-04-05'))
+        self.assertIn('我的目标值', p)
+        self.assertIn('盈亏平衡 ROAS', p)
+        self.assertIn('目标 ROAS', p)
+        # 最要紧的一句：净额为正 ≠ 该加预算
+        self.assertIn('净额为正', p)
+        self.assertIn('加预算', p)
+
+    def test_prompt_has_no_target_block_when_unset(self):
+        """没填就不该出现这一段 —— 让 AI 以为有硬要求是更糟的错。"""
+        snap = {'id': 'a1', 'name': 'X', 'status': 'ACTIVE', 'spend': 100.0,
+                'clicks': 100, 'purchase': 0, 'daily_spend': []}
+        p = eng.build_prompt([snap], {'target_roas': None, 'breakeven_roas': None},
+                             window=('2026-04-01', '2026-04-05'))
+        self.assertNotIn('我的目标值', p)
+
+    def test_cpa_helpers_read_correctly(self):
+        r = self._row(spend=540.0, rev=842.0, orders=24)
+        self.assertAlmostEqual(eng._cpa_of(r['net_view'], r), 22.5, places=1)
+        self.assertIsNone(eng._cpa_of(r['net_view'], {'purchase': 0, 'spend': 540.0}))
+        self.assertIsNone(eng._target_cpa({}))
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

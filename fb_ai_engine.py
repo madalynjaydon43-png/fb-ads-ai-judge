@@ -46,6 +46,27 @@ ENABLE_SIGNAL_FLAGS = True       # 信号旗：命中强信号的广告在 promp
                                  #   条件 B 实测：关旗后 2/2 轮仍 8/8 ⇒ 它只是冗余保险，不是主力）
 
 KILL_STOP_NET = 0.0       # 止损线：可见窗口净额 ≤ 此值 → 强制暂停（这段没赚钱，放量救不了亏损）
+                                #   🔴 已知偏松，等价于「ROAS ≥ 1 就算赚钱」—— 而广告费的真实盈亏线是
+                                #   ROAS = 1/毛利率（40% 毛利 ⇒ 2.5；50% ⇒ 2.0）。见下方 TARGET_ROAS。
+
+# ---------- 目标值（2026-10-03 用户提出：想让工具按「我要求多少」判断，而不是只按「有没有亏」）
+# ⚠️ 这几个值**必须由用户填**，不能由代码猜 —— 猜出来的阈值和当初那个 1.35 拟合值一样，
+#    换生意就失真。所以：config 里没给 ⇒ **该判据不启用**（而不是用默认值悄悄生效）。
+#    UI 上做成可填项；填了才生效，reason 里要写明用的是哪个目标值。
+TARGET_ROAS = 2.0           # 目标 ROAS（广告费至少要带回几倍收入）。**业务默认值，务必按自己毛利改**
+                            #   换算：目标 ROAS = 1 / 目标毛利率。40% 毛利 ⇒ 2.5；50% ⇒ 2.0。
+BREAKEVEN_ROAS = None       # 盈亏平衡 ROAS（= 1/毛利率）。**止损线用它**，不给则止损线退回 net<=0
+                            #   🔴 为什么不直接拿 TARGET_ROAS 当止损线：小额血亏会一直烧钱，
+                            #   止损要卡在「盈亏平衡」而不是「是否达到目标」——
+                            #   **止损线 = 不亏（breakeven），加预算资格线 = 够本且够赚（target）。**
+                            #   两条线必须分开，否则要么放过持续失血，要么永远不敢加预算。
+TARGET_CPA = None           # 目标 CPA（愿为一个订单花多少钱）。**默认不启用** ——
+                            #   CPA 是绝对金额、跨品类差几十倍，代码猜不出来。
+                            #   给了之后会进 prompt 与「加预算资格线」，并算 cpa_actual 供对照。
+# ⚠️ 「未提供 ⇒ 不启用」的判断都用 `is None`，**不是 falsy** ——
+#   0 是「我要求 ROAS=0」（= 不设限），None 才是「我没填」。用 `or` 会把 0 当成没填。
+
+
 NOMINATE_FILL_RATE = 0.90  # 提名线①：顶格率 ≥ 此值 —— 预算卡住了它，不是它跑不动
 NOMINATE_FREQ_MAX = 1.35   # 提名线②（**旧值，已被 ③ 取代，保留仅为兼容旧 config**）
 NOMINATE_FREQ_SATURATED = 3.5   # 提名线②：末段频次 < 此值才算「受众还没看腻」
@@ -423,6 +444,39 @@ def _flag_section(snapshot):
             + '\n  → 出现这些信号时，**先怀疑某一环坏了，而不是先怀疑「没人要」**。\n')
 
 
+def _target_block(config):
+    """组装「你的目标值」段落。**没填的项不出现** —— 让 AI 知道哪些是硬要求、哪些没要求。"""
+    config = config or {}      # build_prompt 允许 config=None；忘了这层会 TypeError
+    tr = _target_roas(config)
+    be = _breakeven_roas(config)
+    tc = _target_cpa(config)
+    if tr is None and be is None and tc is None:
+        return ''
+    L = ['【我的目标值（这是硬要求，不是参考）】']
+    if be is not None:
+        L.append('- 盈亏平衡 ROAS = %.2f  ⇒ 低于它就是**卖得越多亏得越多**（= 1/毛利率 %.0f%%）'
+                 % (be, (100.0 / be) if be else 0.0))
+    if tr is not None:
+        L.append('- 目标 ROAS = %.2f  ⇒ 只有达到它才**值得加预算**' % tr)
+    if tc is not None:
+        L.append('- 目标 CPA = $%.2f / 单  ⇒ 单均成本高于它就不划算' % tc)
+    L.append('')
+    L.append('  ⚠️ **两档线的区别必须分清（这是最容易搞错的地方）**：')
+    if be is not None:
+        L.append('    · ROAS < %.2f  → **该关**：它在净亏，而且加放量只会亏更多' % be)
+    if be is not None and tr is not None:
+        L.append('    · %.2f ≤ ROAS < %.2f → **不加预算**（广告费回本了，但按我的要求还没达标，'
+                 '加钱只会放大差距）；同时**不该关**，慢慢看' % (be, tr))
+    if tr is not None:
+        L.append('    · ROAS ≥ %.2f → 才有资格谈加预算（再叠加顶格率、频次条件）' % tr)
+    L.append('  ⇒ **「净额为正」不等于「该加预算」**：净额为正只说明广告费回本了，'
+             '能不能赚钱要看 ROAS 有没有达到我的目标值。')
+    L.append('  ⇒ 成效指标不是 purchase 的广告（加购/结账等），**这些线对它不适用**，'
+             '别拿购买 ROAS 去判它跑得好不好。')
+    L.append('')
+    return chr(10).join(L)
+
+
 def build_prompt(snapshot, config, window=None):
     """
     构造发给 LLM 的 prompt。config 是完整配置（含业务规则阈值）。
@@ -536,7 +590,8 @@ def build_prompt(snapshot, config, window=None):
         "而不是只说「亏损所以关停」。\n"
         + (_flag_section(snapshot)
            if bool(config.get('enable_signal_flags', ENABLE_SIGNAL_FLAGS)) else '')
-        + note_text +
+        + note_text
+        + _target_block(config) +
         f"【硬性要求】必须对输入中的**每一条**广告都输出一条结论，共 **{n} 条**，一条不能少、不能合并、不能跳过。\n"
         "  表现正常、不需要动作的也必须输出，action 填 \"observe\"。宁可全给 observe，也绝不能漏掉任何一条 ——"
         "漏掉等于这条广告没被判断过。\n"
@@ -936,6 +991,80 @@ def _stop_precondition(row, nv, config):
     return False, ''
 
 
+def _target_roas(config):
+    """读「加预算资格线」的目标 ROAS。**没给 ⇒ None（不启用）**。
+
+    🔴 用 `is None` 判「没填」，**不能用 falsy** —— 0 表示「我要求 ROAS=0」（= 不设限），
+    用 `or` 会把 0 当成「没填」然后悄悄退回默认值，那是另一种错。
+    """
+    v = (config or {}).get('target_roas', TARGET_ROAS)
+    if v is None or v == '':
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None      # <=0 视为「不设限」
+
+
+def _breakeven_roas(config):
+    """读止损线用的盈亏平衡 ROAS（= 1/毛利率）。**没给 ⇒ None（止损线退回 net<=0）**。"""
+    v = (config or {}).get('breakeven_roas', BREAKEVEN_ROAS)
+    if v is None or v == '':
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def _target_cpa(config):
+    """读目标 CPA。**默认不给**（跨品类差几十倍，代码猜不出来）。"""
+    v = (config or {}).get('target_cpa', TARGET_CPA)
+    if v is None or v == '':
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def _roas_of(nv):
+    """取窗口 ROAS；快照里没有就算 spend/revenue。**拿不到 ⇒ None（不参与判定）**。
+
+    🔴  缺失/为 None 时**必须返回 None，不能返回 0.0** ——
+       0 会被读成「ROAS=0，远低于任何盈亏线」⇒ 数据缺失的广告被当成血亏强制停。
+       判别：**分母大于 0 且分子是真实取到的数**，才做除法；否则一律 None。
+    """
+    r = _num(nv.get('roas'))
+    # 🔴 roas <= 0 一律当「没取到」，改走下面的 revenue/spend 重算。
+    #   原因：取数层在「拿不到回收」时可能落 0（0/0、缺列、无花费等都会），
+    #   而 0 会被判成「ROAS 最低」⇒ **一条数据不全的广告被当成血亏强制停**。
+    #   宁可「没数据就不判」，也不能「把没数据当成最坏」。
+    if r is not None and r > 0:
+        return r
+    sp, rv = _num(nv.get('spend')), _num(nv.get('revenue'))
+    if sp is None or sp <= 0:
+        return None
+    if rv is None:
+        return None
+    return rv / sp
+
+
+def _cpa_of(nv, row):
+    """取窗口 CPA。优先快照字段，其次用总额除单数。**没有单 ⇒ None（≠0）**。"""
+    c = _num(row.get('cost_per_purchase'))
+    if c is not None and c > 0:
+        return c
+    sp = _num(nv.get('spend'))
+    orders = _num(row.get('purchase'))
+    if sp and sp > 0 and orders and orders > 0:
+        return sp / orders
+    return None
+
+
 def enforce_risk_guardrails(suggestions, snapshots, config):
     """
     关停护栏（硬）+ 加预算提名（软）。
@@ -969,6 +1098,8 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
 
     idx = _row_index(snapshots)
     stop_net = float(config.get('kill_stop_net', KILL_STOP_NET))
+    target_roas = _target_roas(config)
+    breakeven = _breakeven_roas(config)
     fill_min = float(config.get('nominate_fill_rate', NOMINATE_FILL_RATE))
     # 🔴 提名线②：默认用**饱和线**（有行业共识），不再用 v5 拟合出来的 1.35。
     #    config 里若显式写了 nominate_freq_max 仍以它为准（保留旧配置的兼容）。
@@ -992,7 +1123,21 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         net = float(net)
 
         # ---------- 1) 关停护栏 ----------
-        if net <= stop_net:
+        # 🔴 止损线**只用 breakeven**（不亏），**不用 target**（够赚）——
+        #    小额失血会一直烧钱，必须卡在「盈亏平衡」；若拿 target 当止损线，
+        #    那些「在赚但远没到目标」的好广告会被成批误杀。
+        #    target 只用在下文的**加预算资格线**上。
+        _be = breakeven
+        _hit_stop = (net <= stop_net)
+        _hit_be = False
+        if _be is not None:
+            _r = _roas_of(nv)
+            # 口径不适用（优化目标不是购买）时不判 —— 那种情况 ROAS 天然低，
+            # 用它卡止损就是「按加购口径的广告去比购买口径」，会把靶子搞错。
+            _opt = str(row.get('optimization_event') or '')
+            if _r is not None and (not _opt or 'purchase' in _opt):
+                _hit_be = _r < _be
+        if _hit_stop or _hit_be:
             if act not in STOP_ACTIONS:
                 blocked, why = _stop_precondition(row, nv, config or {})
                 if blocked:
@@ -1018,9 +1163,16 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
                 s['action'] = 'pause'
                 s['budget_change_pct'] = 0
                 s['guardrail'] = 'forced_pause'
-                s['reason'] = ('【护栏·止损】可见窗口净额 %+.2f%s ≤ %.2f：'
-                               '这段没赚钱，放量救不了亏损 → 强制暂停（AI 原判「%s」）。原理由：%s'
-                               % (net, _money, stop_net, ACTION_CN.get(act, act), s.get('reason', '')))
+                _why = ('可见窗口净额 %+.2f%s ≤ %.2f：这段没赚钱，放量救不了亏损'
+                        % (net, _money, stop_net))
+                if _hit_be:
+                    _r = _roas_of(nv)
+                    _why = ('窗口 ROAS %.2f < 盈亏平衡线 %.2f（= 1/毛利率 %.0f%%）：'
+                            '**广告费虽然回本了，但商品成本吃掉全部收入，卖得越多亏得越多**'
+                            '（净额 %+.2f 仍为正，所以「只看不亏」根本抓不到它）'
+                            % (_r, _be, (100.0 / _be) if _be else 0.0, net))
+                s['reason'] = ('【护栏·止损】%s → 强制暂停（AI 原判「%s」）。原理由：%s'
+                               % (_why, ACTION_CN.get(act, act), s.get('reason', '')))
                 stats['forced_pause'] += 1
             continue      # 已经在停，不需要再谈加钱
 
@@ -1051,6 +1203,29 @@ def enforce_risk_guardrails(suggestions, snapshots, config):
         if fr is None or fl is None:
             continue
         fr, fl = float(fr), float(fl)
+
+        # 🔴 2026-10-03 加：加预算**资格线** —— ROAS 必须达到目标值。
+        #   起因是实测漏洞：net>0 + 顶格 + 频次不饱和的广告会被提名，可 ROAS 只有 1.17~1.56
+        #   （按 50% 毛利全都在亏）。净额为正只说明「广告费回本了」，**加更多钱会亏得更快**。
+        #   ⇒ 资格线 = **够本且够赚**（target），与止损线的 **够本就行**（breakeven）不同档。
+        if target_roas is not None:
+            _r = _roas_of(nv)
+            _opt = str(row.get('optimization_event') or '')
+            # 口径不适用时不用这个线（加购广告的购买 ROAS 天然低，不是它跑得差）
+            if _r is not None and _r < target_roas and (not _opt or 'purchase' in _opt):
+                s['nomination'] = {
+                    'blocked_by': 'target_roas',
+                    'target_roas': target_roas, 'roas': round(_r, 2),
+                    'note': '未达目标 ROAS，不予提名加预算',
+                }
+                s['reason'] = (s.get('reason', '') +
+                               '【护栏·加预算资格】窗口 ROAS %.2f < 目标 %.2f ⇒ **不给它加预算**：'
+                               '净额为正只说明广告费回本了，按目标口径它还没达标，'
+                               '加更多钱只会把亏损放大（原判「%s」保留，人工可复核）。'
+                               % (_r, target_roas, ACTION_CN.get(act, act)))
+                stats['blocked_by_target_roas'] = stats.get('blocked_by_target_roas', 0) + 1
+                continue
+
         # 频次增幅：只在首末都拿到时才算，拿不到就不 disqualify（信息缺失 ≠ 不合格）
         growth = None
         if ff is not None and fl is not None:
