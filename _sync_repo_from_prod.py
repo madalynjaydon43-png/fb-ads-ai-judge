@@ -32,4 +32,15 @@ back = io.open(REPO, encoding='utf-8').read()
 assert back[back.index(MARK):] == tail, '独有块被改动'
 assert back.startswith(prod.rstrip('\n')), '生产内容未完整写入'
 print('OK  repo_lines=%d (was %d)  tail_bytes=%d' % (len(back.splitlines()), len(repo.splitlines()), len(tail)))
-print('keys_check:', all(k in back for k in ('target_cpa = _target_cpa(config)', "blocked_by': 'target_cpa'", '两把尺子都要过')))
+# 生产标记自检：确认最新一批生产改动都随同步进了仓库。
+# 2026-10-07 更新：原检查的两个串（blocked_by': 'target_cpa' / 两把尺子都要过）
+# 在 10-03「CPA 降为参考线、ROI 撤出」后就不存在了，恒为 False —— 过时自检比没有更糟
+# （每次跑都报红，真出问题时反而分不清）。改为当前实际存在的标记，且**硬失败**。
+PROD_MARKERS = (
+    'def _target_cpa(config):',              # CPA 业务目标
+    "'blocked_by_precondition'",             # 前置条件护栏
+    "row['visible_net'] = _nv.get('net')",   # 2026-10-07 判断时可见净
+)
+missing = [k for k in PROD_MARKERS if k not in back]
+assert not missing, '同步后仓库缺少预期的生产标记：%s' % missing
+print('keys_check: OK (%d/%d)' % (len(PROD_MARKERS), len(PROD_MARKERS)))
