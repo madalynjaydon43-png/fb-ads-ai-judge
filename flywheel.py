@@ -19,7 +19,7 @@
 
 outcome:
     {"window": ["2026-09-28","2026-10-02"], "spend": 87.3, "purchase_value": 210.5,
-     "fill_rate": 0.8, "net": 123.2, "label": "increase_budget",
+     "fill_rate": 0.8, "net": 123.2, "visible_net": 96.4, "label": "increase_budget",
      "net_stop": 0.0, "net_hold": 123.2, "net_up": 131.4,
      "source": "simulated"|"real", "counterfactual": true|false}
 
@@ -63,6 +63,26 @@ def _snapshot_day(snap):
     return ''
 
 
+def _snapshot_visible_net(snap, feat=None):
+    """取「判断时可见净」。优先快照顶层 visible_net（make_snapshot 显式给的），
+    其次 net_view.net，最后用特征重算（收入 − 花费）。取不到返回 None。
+
+    这是 derive_label v2 的暂停口径（可见净），与「后续窗口净 outcome.net」是两回事。
+    """
+    snap = snap or {}
+    v = snap.get('visible_net')
+    if v is None:
+        v = (snap.get('net_view') or {}).get('net')
+    if v is None and feat and '收入' in feat and '花费' in feat:
+        v = float(feat['收入']) - float(feat['花费'])
+    if v is None:
+        return None
+    try:
+        return round(float(v), 2)
+    except (TypeError, ValueError):
+        return None
+
+
 def record_snapshot(snap, tool_action=None, path=None, ts=None):
     """把一条判断快照追加进 store。同广告同天**至多一条**（重复调用返回 False）。
 
@@ -84,6 +104,8 @@ def record_snapshot(snap, tool_action=None, path=None, ts=None):
         'ad_id': ad_id,
         'ad_name': str((snap or {}).get('name') or ''),
         'key': key,
+        # 判断时可见净（落盘存档）：打标时优先用它（derive_label v2 的暂停口径）。
+        'visible_net': _snapshot_visible_net(snap, feat),
         'features': feat,
         'tool_action': tool_action,
         'outcome': None,
@@ -228,6 +250,9 @@ def build_records_from_truth(data_csv=None, truth_csv=None, hid_csv=None):
             'purchase_value': round(rev, 2),
             'fill_rate': round(fill, 3),
             'net': round(net, 2),
+            # 判断时可见净（前 5 天）—— 暂停标签的口径（见 derive_label v2）。
+            # 与『后续净 net』是两个窗口，别混。
+            'visible_net': round(feat['收入'] - feat['花费'], 2),
             'net_stop': 0.0,
             'net_hold': round(fnum(t.get('不动_净')), 2),
             'net_up': round(fnum(t.get('加预算_净')), 2),
@@ -319,6 +344,8 @@ def build_records_from_window(csv_path, head_days=5, split_date=None):
             'purchase_value': round(nv['revenue'], 2),
             'fill_rate': round(nv['fill_rate'], 3),
             'net': round(nv['net'], 2),
+            # 判断时可见净（前 head_days 天）—— 暂停标签的口径（derive_label v2）
+            'visible_net': round(feat['收入'] - feat['花费'], 2),
             'net_stop': 0.0,
             'net_hold': round(nv['net'], 2),
             'net_up': round(nv['net'], 2),
@@ -347,13 +374,19 @@ def backfill_from_window(csv_path, path=None, head_days=5, split_date=None):
 
 
 def records_to_samples(recs):
-    """记录列表 → 训练/判卷样本列表。标签缺失时按 derive_label 现算。"""
+    """记录列表 → 训练/判卷样本列表。标签缺失时按 derive_label 现算。
+
+    outcome 里没有 visible_net 时，用记录级的 visible_net 补上 —— 这样
+    「判断时落盘、后来补结局」的真实飞轮记录也能按可见净打标（derive_label v2）。
+    """
     out = []
     for r in recs:
         feats = r.get('features')
         if not feats:
             continue
-        o = r.get('outcome') or {}
+        o = dict(r.get('outcome') or {})
+        if o.get('visible_net') is None and r.get('visible_net') is not None:
+            o['visible_net'] = r['visible_net']
         lab = o.get('label')
         if lab is None and o:
             lab = derive_label(o)

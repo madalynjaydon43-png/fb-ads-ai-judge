@@ -440,9 +440,18 @@ def load_csv_grouped(path, strict=True, quiet=False):
 # ==================== 3. 标签口径 ====================
 
 def derive_label(outcome, min_spend=MIN_OUTCOME_SPEND):
-    """按「后续窗口结局」打标签。返回 'pause' / 'increase_budget' / 'observe' / None。
+    """按「可见结局」打标签。返回 'pause' / 'increase_budget' / 'observe' / None。
 
-    outcome 需要：spend（后续窗口花费）、net（后续窗口净）、可选 fill_rate（顶格率）。
+    outcome 需要：spend（后续窗口花费，样本量门槛）、可选 visible_net（判断时
+    可见净）、net（后续窗口净，visible_net 缺失时的回退）、可选 fill_rate（顶格率）。
+
+    🔴 口径 v2（2026-10-07 修）：**暂停判据用判断时可见的净（visible_net），
+    不再用结局窗口净（net）。** 理由：
+      · 决定停不停，只能依据当时看得到的盈亏 —— 用未来净判「该不该停」是口径错误；
+      · 出题口径「暂停」= 可见净 ≤ 0（真值表判定依据写的就是「可见亏损」），
+        旧口径与它一致率只有 58%，是训练标签与考场的头号错位源；
+      · 护栏止损线本来就用可见净 —— 标签改了才和护栏同源。
+    缺 visible_net 时回退 net，兼容 10-07 之前的旧记录。
     """
     if not outcome:
         return None
@@ -451,11 +460,12 @@ def derive_label(outcome, min_spend=MIN_OUTCOME_SPEND):
         return None
     if float(spend) < float(min_spend):
         return None                      # 后续基本没投，学不到东西
-    net = outcome.get('net')
-    if net is None:
+    # 暂停判据：优先可见净（判断时点），缺则回退结局净（旧记录）
+    vis = outcome.get('visible_net')
+    base = outcome.get('net') if vis is None else vis
+    if base is None:
         return None
-    net = float(net)
-    if net <= 0:
+    if float(base) <= 0:
         return 'pause'
     fr = outcome.get('fill_rate')
     if fr is not None and float(fr) >= FILL_RATE_UP:
@@ -661,7 +671,10 @@ class TableJudger:
                 outcome = rec.get('outcome')
                 label = (outcome or {}).get('label') if outcome else None
                 if label is None:
-                    label = derive_label(outcome)
+                    o = dict(outcome or {})
+                    if o.get('visible_net') is None and rec.get('visible_net') is not None:
+                        o['visible_net'] = rec['visible_net']
+                    label = derive_label(o) if o else None
                 if label and rec.get('features'):
                     samples.append({'features': rec['features'], 'label': label})
         return self.fit(samples)

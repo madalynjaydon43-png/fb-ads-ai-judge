@@ -424,6 +424,11 @@ def make_snapshot(campaigns_insights):
             _nv = _net_view(days, row.get('adset_daily_budget') or row.get('campaign_daily_budget'))
             if _nv:
                 row['net_view'] = _nv
+                # 判断时可见净的**显式命名**（= net_view.net，同值，只多一个名字）。
+                # 为什么单列一个：决定「停不停」只能依据判断当时看得到的盈亏；
+                # 飞轮打标（derive_label v2）的暂停口径就是它，不是「后续窗口净」。
+                # 两个窗口同名 net 易混，这里给可见净一个不会认错的名字。
+                row['visible_net'] = _nv.get('net')
         # ---- P0/P1：口径与竞争对照（2026-10-02）----
         # 只带非空项：缺了就不出现在快照里，prompt 会按「该字段未知」处理。
         # 这三类字段不参与任何计算，只作为**读数的前提**进入 prompt：

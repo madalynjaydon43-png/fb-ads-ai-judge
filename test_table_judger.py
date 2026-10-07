@@ -193,6 +193,28 @@ class TestFeatures(unittest.TestCase):
             self.assertLessEqual(abs(a - b), tol,
                                  msg='快照/CSV 两条路对不上：%s (%r vs %r)' % (k, a, b))
 
+    def test_snapshot_exposes_visible_net(self):
+        """make_snapshot 必须显式给出判断时可见净（= net_view.net），供飞轮打标取用。"""
+        rows = _read_csv(P_DATA)
+        rs = [r for r in rows if r['广告系列名称'] == rows[0]['广告系列名称']]
+        sn = eng.make_snapshot([{
+            'id': 'x', 'name': 'x', 'budget_type': 'ABO', 'adset_daily_budget': 10.0,
+            'daily_spend': [{
+                'date': r['报告开始日期'], 'spend': float(r['已花费金额 (USD)']),
+                'purchase': int(float(r['购物次数'])),
+                'purchase_value': float(r['购物转化价值']),
+                'impressions': int(float(r['展示次数'])), 'clicks': int(float(r['链接点击量'])),
+                'reach': int(float(r['覆盖人数'])), 'frequency': float(r['频次']),
+                'add_to_cart': int(float(r['加入购物车次数'])),
+                'initiate_checkout': int(float(r['结账发起次数'])),
+                'add_payment_info': int(float(r['添加支付信息'])),
+            } for r in rs],
+        }])[0]
+        self.assertIn('visible_net', sn, '快照必须带判断时可见净')
+        self.assertIsNotNone(sn['visible_net'])
+        self.assertAlmostEqual(float(sn['visible_net']), float(sn['net_view']['net']),
+                               places=6, msg='visible_net 必须等于 net_view.net（同值别名）')
+
 
 class TestDeriveLabel(unittest.TestCase):
     def test_four_cases(self):
@@ -209,6 +231,29 @@ class TestDeriveLabel(unittest.TestCase):
         # ④ 其余 → 观察
         self.assertEqual(tj.derive_label({'spend': 30, 'net': 12.0, 'fill_rate': 0.89}), 'observe')
         self.assertEqual(tj.derive_label({'spend': 30, 'net': 12.0}), 'observe')
+
+    def test_pause_uses_visible_net_v2(self):
+        """v2：暂停看【可见净】，不看结局净（与出题口径 / 护栏止损线同源）。"""
+        # 可见亏损，但结局其实赚了 → 仍判 pause（考场口径）
+        self.assertEqual(tj.derive_label(
+            {'spend': 30, 'visible_net': -5.0, 'net': 20.0, 'fill_rate': 0.5}), 'pause')
+        # 可见赚钱，但结局亏了 → v2 不再误判 pause（旧口径会判 pause）
+        self.assertNotEqual(tj.derive_label(
+            {'spend': 30, 'visible_net': 8.0, 'net': -9.0, 'fill_rate': 0.5}), 'pause')
+        # 可见净 = 0 → pause（与旧口径的边界一致）
+        self.assertEqual(tj.derive_label(
+            {'spend': 30, 'visible_net': 0.0, 'net': 50.0, 'fill_rate': 0.9}), 'pause')
+        # 可见净 > 0 → 按后续顶格率走加预算/观察
+        self.assertEqual(tj.derive_label(
+            {'spend': 30, 'visible_net': 8.0, 'net': 9.0, 'fill_rate': 0.95}),
+            'increase_budget')
+        # 回退：没有 visible_net 时用 net（兼容 10-07 之前的旧记录）
+        self.assertEqual(tj.derive_label(
+            {'spend': 30, 'net': -5.0, 'fill_rate': 0.5}), 'pause')
+        self.assertEqual(tj.derive_label(
+            {'spend': 30, 'net': 12.0, 'fill_rate': 0.5}), 'observe')
+        # 两个都没有 → 不打标签
+        self.assertIsNone(tj.derive_label({'spend': 30, 'fill_rate': 0.5}))
 
 
 class TestRuleFallback(unittest.TestCase):
@@ -446,6 +491,22 @@ class TestStore(unittest.TestCase):
             self.assertEqual(recs[0]['tool_action'], 'observe')
             self.assertIsNone(recs[0]['outcome'])
             self.assertEqual(len(recs[0]['features']), len(tj.FEATURE_KEYS))
+
+    def test_record_snapshot_carries_visible_net(self):
+        """落盘的记录必须带判断时可见净（derive_label v2 的暂停口径）。"""
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, 'store.jsonl')
+            flywheel.record_snapshot(mk_snapshot('88', net=3.5), 'observe', path=p)
+            rec = flywheel.load_store(p)[0]
+            self.assertEqual(rec['visible_net'], 3.5)
+        # 没有 net_view 时用特征重算（收入 − 花费）
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, 'store.jsonl')
+            snap = mk_snapshot('89', net=None)
+            flywheel.record_snapshot(snap, 'observe', path=p)
+            rec = flywheel.load_store(p)[0]
+            self.assertEqual(rec['visible_net'],
+                             round(rec['features']['收入'] - rec['features']['花费'], 2))
 
     def test_backfill_writes_labels_and_stats(self):
         with tempfile.TemporaryDirectory() as td:
